@@ -2,6 +2,6 @@ node_modules/
 data/
 evals/results/
 pnpm-lock.yaml
-docs/screenshot.png
+docs/images/
 # The system prompt is versioned by its SHA-256 (prompts/CHANGELOG.md); a reformat would change it.
 apps/agent/prompts/

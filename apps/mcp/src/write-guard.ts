@@ -17,7 +17,7 @@
  *
  * runAgent extracts all of this from the request text and passes it to the MCP server in its env;
  * neither the model nor API data can add to it. The match is lexical: an id or address inside
- * text the user pasted, or in "do NOT cancel <id>", counts as named (docs/solution.md, Known
+ * text the user pasted, or in "do NOT cancel <id>", counts as named (docs/roadmap.md, Known
  * limitations).
  */
 
