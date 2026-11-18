@@ -13,7 +13,11 @@ About five minutes, Linux or macOS, no LLM needed until step 4.
 1. `./scripts/doctor.sh` checks Node 24+, pnpm 9, dependencies and `.env` (it never prints
    values) and says what you can run. `--fix` offers the safe local steps (corepack enable,
    `pnpm install`, `cp .env.example .env`), asking first. `pnpm run doctor` does the same
-   (plain `pnpm doctor` is pnpm's own built-in command).
+   (plain `pnpm doctor` is pnpm's own built-in command). On a machine with everything set up it
+   looks like this:
+
+   ![doctor.sh output: toolchain, Oncade keys and optional tools all present, and what you can run](docs/doctor.png)
+
 2. `pnpm install && pnpm test`: no keys, no network.
 3. `pnpm demo`: needs only `ONCADE_API_KEY` (`oncade_platform_test_...`) and `ONCADE_BUSINESS_ID`
    in `.env`. It creates a $1 draft for `demo@example.com` and sends it without email, creates a
