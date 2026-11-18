@@ -13,9 +13,12 @@
     "mcp": "tsx apps/mcp/src/server.ts",
     "runs": "tsx apps/agent/src/runs-cli.ts",
     "eval": "tsx evals/run.ts",
-    "tunnel": "ngrok http 3000",
+    "tunnel": "ngrok http ${WEBHOOK_PORT:-3001}",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "node node_modules/typescript-7/bin/tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.5",
@@ -25,9 +28,15 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/node": "^26.6.6",
+    "eslint": "10.15.0",
+    "globals": "17.14.0",
+    "prettier": "3.10.1",
     "tsx": "^4.23.15",
-    "typescript": "^7.0.2",
+    "typescript": "~6.0.3",
+    "typescript-7": "npm:typescript@^7.0.2",
+    "typescript-eslint": "8.73.0",
     "vitest": "^5.1.0"
   }
 }

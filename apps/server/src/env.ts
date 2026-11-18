@@ -1,13 +1,25 @@
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { ConfigError, parseConfig, type Config } from '../../../packages/config/src/config';
 
-/** Load ./.env (Node 24 built-in) and fail fast on what the app cannot run without. */
-export function loadEnv() {
-  const file = resolve(import.meta.dirname, '../../../.env');
+const ROOT = resolve(import.meta.dirname, '../../..');
+
+/**
+ * Load ./.env (Node 24 built-in; variables already set in the shell win) and validate the whole
+ * environment with Zod. On a bad value: print which variable is wrong and exit 1.
+ */
+export function loadEnv(): Config {
+  const file = resolve(ROOT, '.env');
   if (existsSync(file)) process.loadEnvFile(file);
-  const missing = ['ONCADE_API_KEY', 'ONCADE_BUSINESS_ID'].filter((k) => !process.env[k]);
-  if (missing.length) throw new Error(`Missing in .env: ${missing.join(', ')} (see .env.example)`);
-  process.env.WEBHOOK_LOG ??= resolve(import.meta.dirname, '../../../data/webhooks.jsonl');
+  // The MCP server inside the sandbox gets this path from runAgent, so it must be absolute.
+  process.env.WEBHOOK_LOG ||= resolve(ROOT, 'data/webhooks.jsonl');
+  try {
+    return parseConfig(process.env);
+  } catch (e) {
+    if (!(e instanceof ConfigError)) throw e;
+    console.error(e.message);
+    process.exit(1);
+  }
 }
 
 /** Values that shipped in this repo or are obvious guesses. */

@@ -99,13 +99,10 @@ export function createOncadeClient(cfg: OncadeConfig) {
       'X-Oncade-API-Version': 'v1',
     };
     if (opts.business !== false) headers['X-Target-Business-Id'] = cfg.businessId;
-    // Every write gets a key derived from the operation and its input: a repeat is a no-op on
-    // Oncade's side, which is also what makes retrying a write below safe.
-    const isWrite = method !== 'GET';
-    if (isWrite) headers['Idempotency-Key'] = idempotencyKey(runId, method, path, opts.body);
+    // Every write carries a key derived from the operation and its input, so a repeat is a no-op
+    // on Oncade's side. That is why every request below, writes included, can be retried.
+    if (method !== 'GET') headers['Idempotency-Key'] = idempotencyKey(runId, method, path, opts.body);
     if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
-    // GET is safe to repeat; a write only with its deterministic key (always set above).
-    const retryable = !isWrite || !!headers['Idempotency-Key'];
     const endpoint = `${method} ${path}`;
 
     for (let attempt = 1; ; attempt++) {
@@ -119,7 +116,7 @@ export function createOncadeClient(cfg: OncadeConfig) {
         });
       } catch (e) {
         // Network error or timeout (AbortSignal.timeout -> TimeoutError).
-        if (retryable && attempt < maxAttempts) {
+        if (attempt < maxAttempts) {
           await sleep(backoff(attempt));
           continue;
         }
@@ -129,7 +126,7 @@ export function createOncadeClient(cfg: OncadeConfig) {
       const text = await res.text();
       const parsed: unknown = text ? safeJson(text) : null;
       if (res.ok) return parsed as T;
-      if (retryable && RETRYABLE_STATUS(res.status) && attempt < maxAttempts) {
+      if (RETRYABLE_STATUS(res.status) && attempt < maxAttempts) {
         await sleep(retryAfterMs(res.headers.get('retry-after')) ?? backoff(attempt));
         continue;
       }

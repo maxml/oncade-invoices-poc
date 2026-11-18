@@ -1,25 +1,40 @@
 /**
- * One screen: log in, ask one question, get one answer.
- * Plus the Oncade webhook receiver, which verifies the signature, drops duplicates and appends
- * events to data/webhooks.jsonl for the agent's `recent_webhooks` tool.
+ * Two Fastify apps, served on two ports by server.ts:
  *
- * Built by a function with injected dependencies so the routes can be tested with fastify.inject.
+ * - The UI app (PORT, bound to 127.0.0.1): log in, ask one question, get one answer; /healthz.
+ *   It has no webhook route. Defence in depth: a request that carries proxy headers, a
+ *   non-loopback Host or comes from a non-loopback socket gets 404.
+ * - The webhook app (WEBHOOK_PORT): only POST /webhooks/oncade, which verifies the signature,
+ *   drops duplicates and appends events to data/webhooks.jsonl. `pnpm tunnel` exposes this port
+ *   and nothing else, so the login page and the agent are not reachable through the tunnel at all.
+ *
+ * Built by functions with injected dependencies so the routes can be tested with fastify.inject.
  */
 import { randomBytes } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import formbody from '@fastify/formbody';
 import cookie from '@fastify/cookie';
 import type { AgentOptions, AgentResult } from '../../agent/src/run-agent';
+import { BudgetExceededError } from '../../agent/src/runs';
 import { verifyOncadeSignature } from '../../../packages/oncade-client/src/webhook';
 import type { SecurityConfig } from './env';
 import { RateLimiter } from './rate-limit';
 import type { WebhookStore } from './webhook-store';
 
-export interface AppOptions {
+/** Dependencies of GET /healthz. */
+export interface HealthChecks {
+  /** A cheap Oncade call (GET /me); resolves when Oncade answered. */
+  oncade: () => Promise<unknown>;
+  /** Path of the claude CLI, or null when it is not installed. */
+  claude: () => string | null;
+  /** Timeout for the Oncade check. Default 3 s. */
+  timeoutMs?: number;
+}
+
+export interface UiAppOptions {
   security: SecurityConfig;
   runAgent: (prompt: string, opts: AgentOptions) => Promise<AgentResult>;
-  webhookSecret: string;
-  webhookStore: WebhookStore;
+  health: HealthChecks;
   logger?: boolean;
   /** Failed logins per client IP. Default 5 per 15 min. */
   loginLimit?: { max: number; windowMs: number };
@@ -28,8 +43,15 @@ export interface AppOptions {
   now?: () => number;
 }
 
+export interface WebhookAppOptions {
+  webhookSecret: string;
+  webhookStore: WebhookStore;
+  logger?: boolean;
+}
+
 const SESSION_TTL_MS = 12 * 60 * 60_000;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'forwarded', 'x-real-ip'];
 
 /**
@@ -43,9 +65,15 @@ export function isDirectLocal(headers: Record<string, string | string[] | undefi
   return LOCAL_HOSTS.has(name);
 }
 
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  return addr !== undefined && LOOPBACK_ADDRESSES.has(addr);
+}
+
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
-export async function buildApp(o: AppOptions): Promise<FastifyInstance> {
+const notFound = { message: 'Not Found', statusCode: 404 };
+
+export async function buildUiApp(o: UiAppOptions): Promise<FastifyInstance> {
   const now = o.now ?? Date.now;
   const loginLimiter = new RateLimiter(o.loginLimit?.max ?? 5, o.loginLimit?.windowMs ?? 15 * 60_000, now);
   const askLimiter = new RateLimiter(o.askLimit?.max ?? 10, o.askLimit?.windowMs ?? 10 * 60_000, now);
@@ -56,14 +84,39 @@ export async function buildApp(o: AppOptions): Promise<FastifyInstance> {
   await app.register(cookie, { secret: o.security.sessionSecret });
   await app.register(formbody);
 
-  // Webhooks need the raw bytes for the HMAC, so JSON bodies arrive as Buffers.
-  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
-
-  // Through a tunnel or proxy only the webhook receiver exists; everything else is a 404.
+  // The UI port is bound to 127.0.0.1 and never tunnelled. Defence in depth: anything that looks
+  // proxied, names a non-loopback Host, or arrives on a non-loopback socket gets 404.
   app.addHook('onRequest', async (req, reply) => {
-    if (isDirectLocal(req.headers)) return;
-    if (req.routeOptions.url?.startsWith('/webhooks/')) return;
-    return reply.code(404).send({ message: 'Not Found', statusCode: 404 });
+    if (isDirectLocal(req.headers) && isLoopbackAddress(req.socket.remoteAddress)) return;
+    return reply.code(404).send(notFound);
+  });
+
+  app.get('/healthz', async (_req, reply) => {
+    const timeoutMs = o.health.timeoutMs ?? 3_000;
+    const started = Date.now();
+    let oncade: { ok: boolean; ms: number; error?: string };
+    try {
+      await Promise.race([
+        o.health.oncade(),
+        new Promise((_ok, fail) => setTimeout(() => fail(new Error(`timeout after ${timeoutMs} ms`)), timeoutMs).unref()),
+      ]);
+      oncade = { ok: true, ms: Date.now() - started };
+    } catch (e) {
+      const status = (e as { status?: unknown }).status;
+      oncade = {
+        ok: false,
+        ms: Date.now() - started,
+        error: typeof status === 'number' && status > 0 ? `HTTP ${status}` : String((e as Error).message ?? e).slice(0, 200),
+      };
+    }
+    const claudePath = o.health.claude();
+    const checks = {
+      process: { ok: true, uptimeS: Math.round(process.uptime()) },
+      oncade,
+      claude: { ok: claudePath !== null, path: claudePath },
+    };
+    const ok = checks.oncade.ok && checks.claude.ok;
+    return reply.code(ok ? 200 : 503).send({ status: ok ? 'ok' : 'degraded', checks });
   });
 
   const sessionOf = (req: FastifyRequest): string | null => {
@@ -102,14 +155,23 @@ button{font:inherit;padding:8px 16px;margin-top:8px}pre{white-space:pre-wrap;bac
       loginLimiter.reset(ipKey);
       const sid = randomBytes(24).toString('base64url');
       sessions.set(sid, now());
-      reply.setCookie('session', sid, { signed: true, httpOnly: true, sameSite: 'lax', path: '/', maxAge: SESSION_TTL_MS / 1000 });
+      reply.setCookie('session', sid, {
+        signed: true,
+        httpOnly: true,
+        sameSite: 'lax',
+        path: '/',
+        maxAge: SESSION_TTL_MS / 1000,
+      });
       return reply.redirect('/ask');
     }
     loginLimiter.take(ipKey);
     return reply.code(401).type('text/html').send(page('<p>Wrong user or password. <a href="/login">Try again</a></p>'));
   });
 
-  const askForm = (q = '', allowChanges = false) => `<form method="post" action="/ask"><textarea name="q" rows="3" placeholder="e.g. Create a draft invoice for Acme, billing@acme.example, 10 hours at $50">${esc(q)}</textarea>
+  const askForm = (
+    q = '',
+    allowChanges = false,
+  ) => `<form method="post" action="/ask"><textarea name="q" rows="3" placeholder="e.g. Create a draft invoice for Acme, billing@acme.example, 10 hours at $50">${esc(q)}</textarea>
 <label class="muted"><input type="checkbox" name="allowChanges" value="1"${allowChanges ? ' checked' : ''}> Allow changes (create, send, cancel). Off: the agent can only read and propose.</label><br>
 <button>Ask</button></form>`;
 
@@ -122,11 +184,17 @@ button{font:inherit;padding:8px 16px;margin-top:8px}pre{white-space:pre-wrap;bac
     const allowChanges = req.body?.allowChanges === '1';
     if (!q) return reply.redirect('/ask');
     if (!askLimiter.take(sid)) {
-      return reply.code(429).type('text/html').send(page(`${askForm(q, allowChanges)}<p>Too many questions in a short time. Wait a few minutes.</p>`));
+      return reply
+        .code(429)
+        .type('text/html')
+        .send(page(`${askForm(q, allowChanges)}<p>Too many questions in a short time. Wait a few minutes.</p>`));
     }
     // One agent run per server at a time: each run spawns the CLI and the MCP server.
     if (agentRunning) {
-      return reply.code(429).type('text/html').send(page(`${askForm(q, allowChanges)}<p>Another question is being answered. Try again in a moment.</p>`));
+      return reply
+        .code(429)
+        .type('text/html')
+        .send(page(`${askForm(q, allowChanges)}<p>Another question is being answered. Try again in a moment.</p>`));
     }
     agentRunning = true;
     try {
@@ -138,12 +206,31 @@ button{font:inherit;padding:8px 16px;margin-top:8px}pre{white-space:pre-wrap;bac
 <p class="muted">${r.mode} · sandboxed: ${r.sandboxed} · ${r.durationMs ?? '?'} ms · $${r.costUsd?.toFixed(4) ?? '?'} · prompt ${esc(r.promptVersion)}</p>`),
       );
     } catch (e) {
+      if (e instanceof BudgetExceededError) {
+        req.log.warn({ spentUsd: e.spentUsd, capUsd: e.capUsd }, 'daily agent budget reached');
+        return reply
+          .code(429)
+          .type('text/html')
+          .send(page(`${askForm(q, allowChanges)}<p class="warn">${esc(e.message)}</p>`));
+      }
       req.log.error(e);
-      return reply.code(500).type('text/html').send(page(`${askForm(q, allowChanges)}<h2>Agent failed</h2><pre>${esc(String(e))}</pre>`));
+      return reply
+        .code(500)
+        .type('text/html')
+        .send(page(`${askForm(q, allowChanges)}<h2>Agent failed</h2><pre>${esc(String(e))}</pre>`));
     } finally {
       agentRunning = false;
     }
   });
+
+  return app;
+}
+
+/** The only thing on the webhook port: POST /webhooks/oncade. Every other path is Fastify's 404. */
+export async function buildWebhookApp(o: WebhookAppOptions): Promise<FastifyInstance> {
+  const app = Fastify({ logger: o.logger ?? false });
+  // The HMAC covers the exact bytes, so JSON bodies arrive as Buffers.
+  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
   app.post('/webhooks/oncade', (req, reply) => {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);

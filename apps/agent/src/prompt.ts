@@ -18,6 +18,8 @@ export function promptInfo(dir = PROMPTS_DIR): PromptInfo {
   const changelog = readFileSync(join(dir, 'CHANGELOG.md'), 'utf8');
   const m = changelog.match(/^## (v\d+) sha256:([0-9a-f]{12}) /m);
   if (!m) throw new Error('prompts/CHANGELOG.md has no "## vN sha256:<12 hex> DATE" entry');
-  const sha256 = createHash('sha256').update(readFileSync(join(dir, 'system.md'))).digest('hex');
+  const sha256 = createHash('sha256')
+    .update(readFileSync(join(dir, 'system.md')))
+    .digest('hex');
   return { version: m[1], changelogHash: m[2], sha256 };
 }

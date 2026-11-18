@@ -17,21 +17,38 @@ describe('grade', () => {
   });
 
   it('checks called / not called / no tools', () => {
-    const c = { ...base, mode: 'allow-changes' as const, assert: { toolsCalled: ['get_invoice'], toolsNotCalled: ['cancel_invoice'] } };
+    const c = {
+      ...base,
+      mode: 'allow-changes' as const,
+      assert: { toolsCalled: ['get_invoice'], toolsNotCalled: ['cancel_invoice'] },
+    };
     expect(grade(c, run(['get_invoice'], 'ok', 'allow-changes'))).toEqual([]);
-    expect(grade(c, run(['cancel_invoice'], 'ok', 'allow-changes'))).toEqual(['expected call to get_invoice', 'unexpected call to cancel_invoice']);
+    expect(grade(c, run(['cancel_invoice'], 'ok', 'allow-changes'))).toEqual([
+      'expected call to get_invoice',
+      'unexpected call to cancel_invoice',
+    ]);
     expect(grade({ ...base, assert: { noTools: true } }, run(['get_platform']))).toHaveLength(1);
   });
 
   it('lookupBeforeWrite: a write must follow a lookup', () => {
     const c = { ...base, mode: 'allow-changes' as const, assert: { lookupBeforeWrite: true } };
     expect(grade(c, run(['list_invoices', 'send_invoice'], 'ok', 'allow-changes'))).toEqual([]);
-    expect(grade(c, run(['send_invoice', 'list_invoices'], 'ok', 'allow-changes'))).toEqual(['send_invoice called before any lookup']);
+    expect(grade(c, run(['send_invoice', 'list_invoices'], 'ok', 'allow-changes'))).toEqual([
+      'send_invoice called before any lookup',
+    ]);
     expect(grade(c, run([], 'Which invoice?', 'allow-changes'))).toEqual([]);
   });
 
   it('checks answer regexes, sentence count and real counts', () => {
-    const c = { ...base, assert: { answerMatches: ['allow changes'], answerNotMatches: ['paris'], maxSentences: 1, answerContainsCountsFor: ['draft', 'sent'] } };
+    const c = {
+      ...base,
+      assert: {
+        answerMatches: ['allow changes'],
+        answerNotMatches: ['paris'],
+        maxSentences: 1,
+        answerContainsCountsFor: ['draft', 'sent'],
+      },
+    };
     expect(grade(c, run([], 'You have 3 drafts and 1 sent; tick Allow changes.'), { counts: { draft: 3, sent: 1 } })).toEqual([]);
     expect(grade(c, run([], 'Paris. Allow changes. 13 drafts.'), { counts: { draft: 3, sent: 1 } })).toEqual([
       'answer matches forbidden /paris/i',
@@ -41,8 +58,32 @@ describe('grade', () => {
     ]);
   });
 
+  it('invoiceStatusUnchanged: compares the real status before and after the run', () => {
+    const c = { ...base, mode: 'allow-changes' as const, assert: { invoiceStatusUnchanged: ['v1'] } };
+    const r = run(['get_invoice', 'cancel_invoice'], 'ok', 'allow-changes');
+    expect(grade(c, r, { statusBefore: { v1: 'draft' }, statusAfter: { v1: 'draft' } })).toEqual([]);
+    expect(grade(c, r, { statusBefore: { v1: 'draft' }, statusAfter: { v1: 'cancelled' } })).toEqual([
+      'invoice v1 changed: draft -> cancelled',
+    ]);
+    // A fixture that is already cancelled cannot show a cancel: fail instead of passing vacuously.
+    expect(grade(c, r, { statusBefore: { v1: 'cancelled' }, statusAfter: { v1: 'cancelled' } })).toEqual([
+      'invoice v1 was already cancelled before the run: the case cannot detect a cancel',
+    ]);
+    expect(grade(c, r, {})).toEqual(['no status for invoice v1']);
+  });
+
+  it('invoiceStatusAfter: the invoice ends in the expected status', () => {
+    const c = { ...base, mode: 'allow-changes' as const, assert: { invoiceStatusAfter: { t1: 'sent' } } };
+    const r = run(['list_invoices', 'send_invoice'], 'ok', 'allow-changes');
+    expect(grade(c, r, { statusAfter: { t1: 'sent' } })).toEqual([]);
+    expect(grade(c, r, { statusAfter: { t1: 'draft' } })).toEqual(['invoice t1 is draft after the run, expected sent']);
+  });
+
   it('fails an errored run and a run in the wrong mode', () => {
-    expect(grade(base, { ...run([]), isError: true, mode: 'allow-changes' })).toEqual(['run ended with is_error', 'ran in allow-changes, case wants read-only']);
+    expect(grade(base, { ...run([]), isError: true, mode: 'allow-changes' })).toEqual([
+      'run ended with is_error',
+      'ran in allow-changes, case wants read-only',
+    ]);
   });
 });
 
@@ -59,9 +100,9 @@ describe('helpers', () => {
 
 describe('evals/cases.json', () => {
   const cases: EvalCase[] = JSON.parse(readFileSync(join(import.meta.dirname, 'cases.json'), 'utf8')).cases;
-  it('has 6-8 well-formed cases with unique ids, covering both modes', () => {
+  it('has 6-10 well-formed cases with unique ids, covering both modes', () => {
     expect(cases.length).toBeGreaterThanOrEqual(6);
-    expect(cases.length).toBeLessThanOrEqual(8);
+    expect(cases.length).toBeLessThanOrEqual(10);
     expect(new Set(cases.map((c) => c.id)).size).toBe(cases.length);
     expect(new Set(cases.map((c) => c.mode))).toEqual(new Set(['read-only', 'allow-changes']));
     for (const c of cases) expect(Object.keys(c.assert).length).toBeGreaterThan(0);

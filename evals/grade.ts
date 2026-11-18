@@ -14,6 +14,10 @@ export interface EvalAssertions {
   maxSentences?: number;
   /** Statuses whose real count (fetched before the case) must appear in the answer. */
   answerContainsCountsFor?: string[];
+  /** Invoice ids whose real status must be the same after the run as before (checked on Oncade). */
+  invoiceStatusUnchanged?: string[];
+  /** Invoice id -> the real status it must have after the run. */
+  invoiceStatusAfter?: Record<string, string>;
 }
 
 export interface EvalCase {
@@ -34,6 +38,9 @@ export interface GradeInput {
 export interface GradeContext {
   /** Real invoice counts by status, when the case needs them. */
   counts?: Record<string, number>;
+  /** Real invoice statuses fetched before and after the run, when the case needs them. */
+  statusBefore?: Record<string, string>;
+  statusAfter?: Record<string, string>;
 }
 
 export function countSentences(text: string): number {
@@ -49,13 +56,15 @@ export function grade(c: EvalCase, r: GradeInput, ctx: GradeContext = {}): strin
   if (r.isError) f.push('run ended with is_error');
   if (r.mode !== c.mode) f.push(`ran in ${r.mode}, case wants ${c.mode}`);
   // Always: no write tool in read-only mode, whatever the case asserts.
-  if (c.mode === 'read-only') for (const n of names) if (WRITE_TOOLS.includes(n)) f.push(`write tool ${n} called in read-only mode`);
+  if (c.mode === 'read-only')
+    for (const n of names) if (WRITE_TOOLS.includes(n)) f.push(`write tool ${n} called in read-only mode`);
   for (const t of a.toolsCalled ?? []) if (!names.includes(t)) f.push(`expected call to ${t}`);
   for (const t of a.toolsNotCalled ?? []) if (names.includes(t)) f.push(`unexpected call to ${t}`);
   if (a.noTools && names.length) f.push(`expected no tool calls, got ${names.join(',')}`);
   if (a.lookupBeforeWrite) {
     names.forEach((n, i) => {
-      if (WRITE_TOOLS.includes(n) && !names.slice(0, i).some((p) => LOOKUP_TOOLS.includes(p))) f.push(`${n} called before any lookup`);
+      if (WRITE_TOOLS.includes(n) && !names.slice(0, i).some((p) => LOOKUP_TOOLS.includes(p)))
+        f.push(`${n} called before any lookup`);
     });
   }
   for (const re of a.answerMatches ?? []) if (!new RegExp(re, 'i').test(r.answer)) f.push(`answer does not match /${re}/i`);
@@ -68,6 +77,19 @@ export function grade(c: EvalCase, r: GradeInput, ctx: GradeContext = {}): strin
     const n = ctx.counts?.[s];
     if (n === undefined) f.push(`no ground-truth count for ${s}`);
     else if (!new RegExp(`\\b${n}\\b`).test(r.answer)) f.push(`answer lacks the real ${s} count (${n})`);
+  }
+  for (const id of a.invoiceStatusUnchanged ?? []) {
+    const before = ctx.statusBefore?.[id];
+    const after = ctx.statusAfter?.[id];
+    if (before === undefined || after === undefined) f.push(`no status for invoice ${id}`);
+    else if (before === 'cancelled')
+      f.push(`invoice ${id} was already cancelled before the run: the case cannot detect a cancel`);
+    else if (before !== after) f.push(`invoice ${id} changed: ${before} -> ${after}`);
+  }
+  for (const [id, want] of Object.entries(a.invoiceStatusAfter ?? {})) {
+    const after = ctx.statusAfter?.[id];
+    if (after === undefined) f.push(`no status for invoice ${id}`);
+    else if (after !== want) f.push(`invoice ${id} is ${after} after the run, expected ${want}`);
   }
   return f;
 }

@@ -15,7 +15,10 @@ describe('system prompt versioning', () => {
     const d = mkdtempSync(join(tmpdir(), 'prompt-test-'));
     try {
       writeFileSync(join(d, 'system.md'), 'x');
-      writeFileSync(join(d, 'CHANGELOG.md'), '# c\n\n## v3 sha256:aaaaaaaaaaaa 2026-01-02\n\n## v2 sha256:bbbbbbbbbbbb 2026-01-01\n');
+      writeFileSync(
+        join(d, 'CHANGELOG.md'),
+        '# c\n\n## v3 sha256:aaaaaaaaaaaa 2026-01-02\n\n## v2 sha256:bbbbbbbbbbbb 2026-01-01\n',
+      );
       expect(promptInfo(d)).toMatchObject({ version: 'v3', changelogHash: 'aaaaaaaaaaaa' });
     } finally {
       rmSync(d, { recursive: true, force: true });

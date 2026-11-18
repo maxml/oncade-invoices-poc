@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentResult } from '../../agent/src/run-agent';
-import { buildApp, isDirectLocal, type AppOptions } from './app';
+import { BudgetExceededError } from '../../agent/src/runs';
+import { buildUiApp, buildWebhookApp, isDirectLocal, isLoopbackAddress, type HealthChecks, type UiAppOptions } from './app';
 import { securityConfig } from './env';
 import { RateLimiter } from './rate-limit';
 import { WebhookStore } from './webhook-store';
@@ -32,22 +33,20 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-async function setup(over: Partial<AppOptions> = {}) {
+const okHealth: HealthChecks = { oncade: async () => ({}), claude: () => '/usr/bin/claude' };
+
+/** `app` is the UI app (PORT), `hooks` the webhook app (WEBHOOK_PORT). */
+async function setup(over: Partial<UiAppOptions> = {}) {
   const d = mkdtempSync(join(tmpdir(), 'oncade-app-test-'));
   dirs.push(d);
   const log = join(d, 'webhooks.jsonl');
   const runAgent = vi.fn(async (_q: string, _o: unknown) => fakeResult());
-  const app = await buildApp({
-    security,
-    runAgent,
-    webhookSecret: SECRET,
-    webhookStore: new WebhookStore(log),
-    ...over,
-  });
-  return { app, runAgent, log, dir: d };
+  const app = await buildUiApp({ security, runAgent, health: okHealth, ...over });
+  const hooks = await buildWebhookApp({ webhookSecret: SECRET, webhookStore: new WebhookStore(log) });
+  return { app, hooks, runAgent, log, dir: d };
 }
 
-type App = Awaited<ReturnType<typeof buildApp>>;
+type App = Awaited<ReturnType<typeof buildUiApp>>;
 
 /** POST an HTML form (the page's forms are urlencoded). */
 const form = (app: App, url: string, fields: Record<string, string>, headers: Record<string, string> = {}) =>
@@ -73,8 +72,20 @@ describe('securityConfig', () => {
     expect(() => securityConfig({ ADMIN_PASSWORD: PASSWORD, SESSION_SECRET: 'dev-only-change-me' })).toThrow(/SESSION_SECRET/);
   });
 
+  it('refuses short values that are not on the default list (length is checked, not only the list)', () => {
+    expect(() => securityConfig({ ADMIN_PASSWORD: 'Xq7-kP2-zR9', SESSION_SECRET: 'y'.repeat(40) })).toThrow(/ADMIN_PASSWORD/); // 11 chars
+    expect(() => securityConfig({ ADMIN_PASSWORD: PASSWORD, SESSION_SECRET: 'a1b2c3d4'.repeat(4).slice(0, 31) })).toThrow(
+      /SESSION_SECRET/,
+    );
+    // The boundaries themselves are accepted.
+    expect(securityConfig({ ADMIN_PASSWORD: 'Xq7-kP2-zR9!', SESSION_SECRET: 'a1b2c3d4'.repeat(4) }).insecureDefaults).toBe(false);
+  });
+
   it('accepts strong values', () => {
-    expect(securityConfig({ ADMIN_PASSWORD: PASSWORD, SESSION_SECRET: 'y'.repeat(40) })).toMatchObject({ insecureDefaults: false, adminUser: 'admin' });
+    expect(securityConfig({ ADMIN_PASSWORD: PASSWORD, SESSION_SECRET: 'y'.repeat(40) })).toMatchObject({
+      insecureDefaults: false,
+      adminUser: 'admin',
+    });
   });
 
   it('allows defaults only with ALLOW_INSECURE_DEFAULTS=1, and flags them', () => {
@@ -125,6 +136,19 @@ describe('/ask', () => {
     expect(runAgent.mock.calls[1][1]).toMatchObject({ allowChanges: true });
   });
 
+  it('over the daily budget answers 429 with the reason, and frees the run lock', async () => {
+    const runAgent = vi.fn(async () => {
+      throw new BudgetExceededError(2.5, 2);
+    });
+    const { app } = await setup({ runAgent });
+    const cookie = await login(app);
+    const r = await form(app, '/ask', { q: 'list invoices' }, { cookie });
+    expect(r.statusCode).toBe(429);
+    expect(r.body).toContain('Daily agent budget of $2.00 reached');
+    expect((await form(app, '/ask', { q: 'again' }, { cookie })).statusCode).toBe(429);
+    expect(runAgent).toHaveBeenCalledTimes(2);
+  });
+
   it('rate-limits agent runs per session', async () => {
     const { app, runAgent } = await setup({ askLimit: { max: 2, windowMs: 60_000 } });
     const cookie = await login(app);
@@ -138,43 +162,91 @@ describe('/ask', () => {
   });
 
   it('allows one agent run per server at a time (second one gets 429, then works again)', async () => {
+    // Only the first run blocks; any later run returns at once. Without the lock the second
+    // request therefore gets a fast 200 and the assertion below fails, instead of a timeout.
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
+    let markStarted!: () => void;
+    const started = new Promise<void>((r) => (markStarted = r));
     const runAgent = vi.fn(async () => {
-      await gate;
+      if (runAgent.mock.calls.length === 1) {
+        markStarted();
+        await gate;
+      }
       return fakeResult();
     });
     const { app } = await setup({ runAgent });
     const cookie = await login(app);
     const first = form(app, '/ask', { q: 'slow' }, { cookie });
-    await vi.waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
+    await started;
     const second = await form(app, '/ask', { q: 'second' }, { cookie });
-    expect(second.statusCode).toBe(429);
+    expect(second.statusCode, 'second /ask while the first run is pending').toBe(429);
+    expect(runAgent).toHaveBeenCalledTimes(1);
     release();
     expect((await first).statusCode).toBe(200);
     expect((await form(app, '/ask', { q: 'third' }, { cookie })).statusCode).toBe(200);
   });
 });
 
-describe('tunnel restriction', () => {
+describe('two ports: UI app vs webhook app', () => {
+  const body = JSON.stringify({ event: 'Platform.Invoice.Sent', data: {}, timestamp: 't' });
+  const webhook = (app: App, headers: Record<string, string> = {}) =>
+    app.inject({
+      method: 'POST',
+      url: '/webhooks/oncade',
+      headers: { ...headers, 'content-type': 'application/json', 'x-oncade-signature': sign(body) },
+      payload: body,
+    });
+
   it.each([
     [{ 'x-forwarded-for': '1.2.3.4' }],
     [{ 'x-forwarded-host': 'abc.ngrok-free.app' }],
     [{ host: 'abc.ngrok-free.app' }],
     [{ host: 'localhost.evil.com' }],
     [{ forwarded: 'for=1.2.3.4' }],
-  ])('through a proxy (%o) only /webhooks/* exists', async (headers) => {
+  ])('UI app: a proxied request (%o) gets 404 on every path', async (headers) => {
     const { app } = await setup();
-    for (const url of ['/', '/login', '/ask', '/nope']) expect((await app.inject({ url, headers })).statusCode).toBe(404);
-    expect((await form(app, '/login', { user: 'admin', password: PASSWORD }, headers as Record<string, string>)).statusCode).toBe(404);
-    const body = JSON.stringify({ event: 'Platform.Invoice.Sent', data: {}, timestamp: 't' });
-    const wh = await app.inject({
-      method: 'POST',
-      url: '/webhooks/oncade',
-      headers: { ...headers, 'content-type': 'application/json', 'x-oncade-signature': sign(body) },
-      payload: body,
-    });
-    expect(wh.statusCode).toBe(200);
+    for (const url of ['/', '/login', '/ask', '/healthz', '/nope'])
+      expect((await app.inject({ url, headers })).statusCode).toBe(404);
+    expect((await form(app, '/login', { user: 'admin', password: PASSWORD }, headers as Record<string, string>)).statusCode).toBe(
+      404,
+    );
+  });
+
+  it('UI app has no webhook route, even for a direct local request', async () => {
+    const { app } = await setup();
+    expect((await webhook(app)).statusCode).toBe(404);
+  });
+
+  it('webhook app exposes nothing but POST /webhooks/oncade (through the tunnel too)', async () => {
+    const { hooks } = await setup();
+    const tunnel = { 'x-forwarded-for': '1.2.3.4', host: 'abc.ngrok-free.app' };
+    for (const url of ['/', '/login', '/ask', '/healthz', '/webhooks', '/webhooks/other']) {
+      expect((await hooks.inject({ url, headers: tunnel })).statusCode, url).toBe(404);
+    }
+    expect((await form(hooks, '/login', { user: 'admin', password: PASSWORD }, tunnel)).statusCode).toBe(404);
+    expect((await form(hooks, '/ask', { q: 'cancel everything', allowChanges: '1' }, tunnel)).statusCode).toBe(404);
+    expect((await hooks.inject({ method: 'GET', url: '/webhooks/oncade', headers: tunnel })).statusCode).toBe(404);
+    expect((await webhook(hooks, tunnel)).statusCode).toBe(200);
+  });
+
+  it('isLoopbackAddress', () => {
+    expect(['127.0.0.1', '::1', '::ffff:127.0.0.1'].map(isLoopbackAddress)).toEqual([true, true, true]);
+    expect(['10.0.0.1', '127.0.0.2', '', undefined].map(isLoopbackAddress)).toEqual([false, false, false, false]);
+  });
+
+  it('a request from a non-loopback socket gets 404 even with clean headers and a localhost Host', async () => {
+    const { app } = await setup();
+    for (const remoteAddress of ['10.0.0.5', '192.168.1.20', '::ffff:10.0.0.5']) {
+      const r = await app.inject({ url: '/login', headers: { host: '127.0.0.1:3000' }, remoteAddress });
+      expect(r.statusCode, remoteAddress).toBe(404);
+    }
+    for (const remoteAddress of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+      expect(
+        (await app.inject({ url: '/login', headers: { host: '127.0.0.1:3000' }, remoteAddress })).statusCode,
+        remoteAddress,
+      ).toBe(200);
+    }
   });
 
   it('direct local requests reach the app', async () => {
@@ -191,13 +263,58 @@ describe('tunnel restriction', () => {
   });
 });
 
+describe('GET /healthz', () => {
+  it('200 with every check ok', async () => {
+    const { app } = await setup();
+    const r = await app.inject('/healthz');
+    expect(r.statusCode).toBe(200);
+    expect(r.json()).toMatchObject({
+      status: 'ok',
+      checks: { process: { ok: true }, oncade: { ok: true }, claude: { ok: true, path: '/usr/bin/claude' } },
+    });
+  });
+
+  it('503 when Oncade answers with an error, and says which status', async () => {
+    const err = Object.assign(new Error('Oncade GET /me -> 401'), { status: 401 });
+    const { app } = await setup({ health: { ...okHealth, oncade: async () => Promise.reject(err) } });
+    const r = await app.inject('/healthz');
+    expect(r.statusCode).toBe(503);
+    expect(r.json()).toMatchObject({
+      status: 'degraded',
+      checks: { oncade: { ok: false, error: 'HTTP 401' }, claude: { ok: true } },
+    });
+  });
+
+  it('503 fast when Oncade hangs (short timeout), and when the claude CLI is missing', async () => {
+    const hang = { ...okHealth, oncade: () => new Promise(() => {}), timeoutMs: 50 };
+    const { app } = await setup({ health: hang });
+    const t = Date.now();
+    const r = await app.inject('/healthz');
+    expect(Date.now() - t).toBeLessThan(1000);
+    expect(r.json().checks.oncade).toMatchObject({ ok: false, error: 'timeout after 50 ms' });
+    const noCli = await setup({ health: { ...okHealth, claude: () => null } });
+    const r2 = await noCli.app.inject('/healthz');
+    expect(r2.statusCode).toBe(503);
+    expect(r2.json().checks.claude).toEqual({ ok: false, path: null });
+  });
+});
+
 describe('POST /webhooks/oncade', () => {
-  const post = (app: Awaited<ReturnType<typeof buildApp>>, body: string, sig = sign(body)) =>
-    app.inject({ method: 'POST', url: '/webhooks/oncade', headers: { 'content-type': 'application/json', 'x-oncade-signature': sig }, payload: body });
-  const ev = JSON.stringify({ event: 'Platform.Invoice.Created', data: { invoiceId: 'inv_1' }, timestamp: '2026-11-18T00:00:00.000Z' });
+  const post = (app: App, body: string, sig = sign(body)) =>
+    app.inject({
+      method: 'POST',
+      url: '/webhooks/oncade',
+      headers: { 'content-type': 'application/json', 'x-oncade-signature': sig },
+      payload: body,
+    });
+  const ev = JSON.stringify({
+    event: 'Platform.Invoice.Created',
+    data: { invoiceId: 'inv_1' },
+    timestamp: '2026-11-18T00:00:00.000Z',
+  });
 
   it('stores a valid event once; a replay of the same signed body is acknowledged but not stored', async () => {
-    const { app, log } = await setup();
+    const { hooks: app, log } = await setup();
     const a = await post(app, ev);
     expect(a.statusCode).toBe(200);
     expect(a.json()).toEqual({ received: true });
@@ -206,37 +323,43 @@ describe('POST /webhooks/oncade', () => {
     expect(b.json()).toEqual({ received: true, duplicate: true });
     const lines = readFileSync(log, 'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
-    expect(JSON.parse(lines[0])).toMatchObject({ event: 'Platform.Invoice.Created', dedupeKey: expect.stringMatching(/^sha256:/) });
+    expect(JSON.parse(lines[0])).toMatchObject({
+      event: 'Platform.Invoice.Created',
+      dedupeKey: expect.stringMatching(/^sha256:/),
+    });
   });
 
   it('remembers seen events across a restart (keys are read back from the log)', async () => {
     const first = await setup();
-    await post(first.app, ev);
-    const again = await buildApp({ security, runAgent: vi.fn(), webhookSecret: SECRET, webhookStore: new WebhookStore(first.log) });
+    await post(first.hooks, ev);
+    const again = await buildWebhookApp({ webhookSecret: SECRET, webhookStore: new WebhookStore(first.log) });
     expect((await post(again, ev)).json()).toEqual({ received: true, duplicate: true });
     expect(readFileSync(first.log, 'utf8').trim().split('\n')).toHaveLength(1);
   });
 
   it('dedupes by the event id when the event has one', async () => {
-    const { app, log } = await setup();
+    const { hooks: app, log } = await setup();
     await post(app, JSON.stringify({ id: 'evt_1', event: 'X', n: 1 }));
     expect((await post(app, JSON.stringify({ id: 'evt_1', event: 'X', n: 2 }))).json()).toMatchObject({ duplicate: true });
     expect(JSON.parse(readFileSync(log, 'utf8')).dedupeKey).toBe('id:evt_1');
   });
 
   it('rejects a bad signature with 401 and stores nothing', async () => {
-    const { app, log } = await setup();
+    const { hooks: app, log } = await setup();
     expect((await post(app, ev, sign(ev + 'x'))).statusCode).toBe(401);
     expect((await post(app, ev, 'zz')).statusCode).toBe(401);
     expect(existsSync(log)).toBe(false);
   });
 
-  it.each(['{not json', '[1,2]', '42', 'null'])('a validly signed body that is not a JSON object (%s) gets 400, not 500', async (body) => {
-    const { app, log } = await setup();
-    const r = await post(app, body);
-    expect(r.statusCode).toBe(400);
-    expect(existsSync(log)).toBe(false);
-  });
+  it.each(['{not json', '[1,2]', '42', 'null'])(
+    'a validly signed body that is not a JSON object (%s) gets 400, not 500',
+    async (body) => {
+      const { hooks: app, log } = await setup();
+      const r = await post(app, body);
+      expect(r.statusCode).toBe(400);
+      expect(existsSync(log)).toBe(false);
+    },
+  );
 });
 
 describe('WebhookStore rotation', () => {
@@ -253,6 +376,23 @@ describe('WebhookStore rotation', () => {
     expect(s.ingest(evs[4]).status).toBe('duplicate');
     const inRotated = evs.find((e) => readFileSync(`${f}.1`, 'utf8').includes(`"i":${JSON.parse(e.toString()).data.i},`))!;
     expect(new WebhookStore(f, 400).ingest(inRotated).status).toBe('duplicate');
+  });
+
+  it('right after a rotation, the same instance still knows the events that moved into .1', () => {
+    const d = mkdtempSync(join(tmpdir(), 'oncade-store-test-'));
+    dirs.push(d);
+    const f = join(d, 'w.jsonl');
+    const s = new WebhookStore(f, 600); // one stored line is 264 bytes: two fit, the third rotates
+    const ev = (i: number) => Buffer.from(JSON.stringify({ event: 'E', data: { i, pad: 'p'.repeat(100) } }));
+    expect(s.ingest(ev(0)).status).toBe('stored');
+    expect(s.ingest(ev(1)).status).toBe('stored');
+    expect(existsSync(`${f}.1`)).toBe(false);
+    expect(s.ingest(ev(2)).status).toBe('stored'); // this one triggers the rotation
+    expect(existsSync(`${f}.1`)).toBe(true);
+    expect(readFileSync(`${f}.1`, 'utf8')).toContain('"i":0,');
+    // Same process, no restart: events 0 and 1 now live only in .1 and must still be duplicates.
+    expect(s.ingest(ev(0)).status).toBe('duplicate');
+    expect(s.ingest(ev(1)).status).toBe('duplicate');
   });
 
   it('skips torn lines when loading keys', () => {

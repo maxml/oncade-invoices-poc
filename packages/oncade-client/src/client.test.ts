@@ -59,7 +59,12 @@ describe('createOncadeClient', () => {
     const a = createOncadeClient({ apiKey: KEY, businessId: 'b', runId: 'run-1', fetch: s.fetch, sleep: noSleep });
     await a.createDraftInvoice(invoice);
     // Same input, keys in another order: still the same operation.
-    await a.createDraftInvoice({ items: invoice.items, date: invoice.date, receiverEmail: invoice.receiverEmail, receiverName: 'Acme' });
+    await a.createDraftInvoice({
+      items: invoice.items,
+      date: invoice.date,
+      receiverEmail: invoice.receiverEmail,
+      receiverName: 'Acme',
+    });
     // A different input in the same run is a different operation.
     await a.createDraftInvoice({ ...invoice, receiverName: 'Globex' });
     // The same input in another run is a new operation.
@@ -71,7 +76,6 @@ describe('createOncadeClient', () => {
     expect(keys[1]).toBe(keys[0]);
     expect(keys[2]).not.toBe(keys[0]);
     expect(keys[3]).not.toBe(keys[0]);
-    expect(keys[0]).toBe(idempotencyKey('run-1', 'POST', '/invoices', JSON.parse(String(s.calls[0].init.body))));
   });
 
   it('puts a key on body-less writes too (cancel), stable per run and invoice', async () => {
@@ -137,6 +141,20 @@ describe('createOncadeClient', () => {
     expect(err).toBeInstanceOf(OncadeError);
     expect(err.body.error).toMatch(/timeout after 30 ms/);
     expect(hanging).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('idempotencyKey', () => {
+  // Known vectors computed outside this code (Python hashlib over "runId\nMETHOD\npath\ncanonical body",
+  // first 16 bytes, version 5 and RFC 4122 variant bits), so a change to what is hashed shows up here.
+  it('matches fixed vectors', () => {
+    expect(idempotencyKey('run-1', 'POST', '/invoices/abc/send', { b: 1, a: 'x' })).toBe('8befe33f-3e47-5994-947f-76e84bed4251');
+    expect(idempotencyKey('run-1', 'PUT', '/invoices/abc/send', { b: 1, a: 'x' })).toBe('27214d6e-d91b-5627-b29a-4b8cdc258b28');
+  });
+
+  it('differs by method for the same run, path and body', () => {
+    const body = { sendEmail: false };
+    expect(idempotencyKey('r', 'POST', '/invoices/1/send', body)).not.toBe(idempotencyKey('r', 'PUT', '/invoices/1/send', body));
   });
 });
 

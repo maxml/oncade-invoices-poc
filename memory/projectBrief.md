@@ -20,5 +20,7 @@ framework, multi-turn chat.
 - The webhook verifier never throws.
 - The agent can call only the Oncade MCP tools and runs sandboxed where bubblewrap is available.
 - Write tools exist in a run only when the user ticked "Allow changes" (or passed `--allow-changes`).
-- Only the webhook route is reachable through a tunnel; no default credentials.
+- Send / cancel only on invoices the user's request names, or drafts created in the same run.
+- The tunnel reaches a separate webhook-only port; the UI port stays on loopback. No default credentials.
+- Agent spend is capped per run and per day.
 - Secrets only in `.env`.

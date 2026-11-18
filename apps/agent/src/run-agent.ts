@@ -11,8 +11,10 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, writeFileSync, existsSync, rmSync, realpathSync, mkdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { parseConfig, type Config } from '../../../packages/config/src/config';
+import { extractInvoiceRefs } from '../../mcp/src/write-guard';
 import { promptInfo, SYSTEM_PROMPT_FILE } from './prompt';
-import { appendRun, DEFAULT_RUNS_LOG, type RunRecord } from './runs';
+import { appendRun, assertDailyBudget, DEFAULT_RUNS_LOG, type RunRecord } from './runs';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const WRITE_TOOLS = ['create_draft_invoice', 'send_invoice', 'cancel_invoice'];
@@ -85,14 +87,19 @@ function which(bin: string): string | null {
 }
 
 /** Env the agent (and the MCP server it starts) gets: nothing else from the host leaks in. */
-function agentEnv(): Record<string, string> {
-  const pass = ['ONCADE_API_KEY', 'ONCADE_BUSINESS_ID', 'ANTHROPIC_API_KEY', 'WEBHOOK_LOG'];
+function agentEnv(c: Config): Record<string, string> {
+  const pass = {
+    ONCADE_API_KEY: c.ONCADE_API_KEY,
+    ONCADE_BUSINESS_ID: c.ONCADE_BUSINESS_ID,
+    ANTHROPIC_API_KEY: c.ANTHROPIC_API_KEY,
+    WEBHOOK_LOG: c.WEBHOOK_LOG,
+  };
   const env: Record<string, string> = {
     HOME: homedir(),
     PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
     LANG: 'C.UTF-8',
   };
-  for (const k of pass) if (process.env[k]) env[k] = process.env[k]!;
+  for (const [k, v] of Object.entries(pass)) if (v) env[k] = v;
   return env;
 }
 
@@ -126,6 +133,7 @@ export interface SandboxInput {
 
 /** Minimal bwrap: read-only system and code, private /tmp, network on, nothing else of $HOME. */
 export function bwrapArgs(s: SandboxInput): string[] {
+  // prettier-ignore
   const args = [
     '--unshare-all', '--share-net', '--die-with-parent', '--new-session',
     '--ro-bind', '/usr', '/usr',
@@ -159,33 +167,78 @@ export function bwrapArgs(s: SandboxInput): string[] {
   return args;
 }
 
+/**
+ * The one place the run mode is decided: read-only unless the caller passed allowChanges === true.
+ * Callers (the web form's checkbox, `--allow-changes`, an eval case) set it from the user's
+ * explicit choice; nothing the model or the API returns reaches it.
+ */
+export function agentMode(allowChanges: boolean | undefined): { readOnly: boolean; mode: AgentResult['mode'] } {
+  const readOnly = allowChanges !== true;
+  return { readOnly, mode: readOnly ? 'read-only' : 'allow-changes' };
+}
+
 /** The MCP config for one run; the mode lives here, outside anything the model controls. */
-export function mcpConfig(opts: { readOnly: boolean; runId: string }) {
+export function mcpConfig(opts: { readOnly: boolean; runId: string; allowedInvoices?: string[] }) {
   return {
     mcpServers: {
       oncade: {
         command: process.execPath,
         args: ['--import', 'tsx', join(ROOT, 'apps/mcp/src/server.ts')],
         cwd: ROOT,
-        env: { ONCADE_READ_ONLY: opts.readOnly ? '1' : '0', ONCADE_RUN_ID: opts.runId },
+        env: {
+          ONCADE_READ_ONLY: opts.readOnly ? '1' : '0',
+          ONCADE_RUN_ID: opts.runId,
+          ONCADE_ALLOWED_INVOICES: (opts.allowedInvoices ?? []).join(','),
+        },
       },
     },
   };
 }
 
-export async function runAgent(prompt: string, opts: AgentOptions = {}): Promise<AgentResult> {
-  const claudeBin = which('claude');
+/** What runAgent touches outside itself; injected in tests. */
+export interface AgentDeps {
+  config: Config;
+  spawn: typeof spawn;
+  which: (bin: string) => string | null;
+  runsLog: string;
+  now: () => Date;
+}
+
+function resolveDeps(d: Partial<AgentDeps>): AgentDeps {
+  const config = d.config ?? parseConfig(process.env);
+  return {
+    config,
+    spawn: d.spawn ?? spawn,
+    which: d.which ?? which,
+    runsLog: d.runsLog ?? config.RUNS_LOG ?? DEFAULT_RUNS_LOG,
+    now: d.now ?? (() => new Date()),
+  };
+}
+
+export async function runAgent(
+  prompt: string,
+  opts: AgentOptions = {},
+  overrides: Partial<AgentDeps> = {},
+): Promise<AgentResult> {
+  const deps = resolveDeps(overrides);
+  const cfg = deps.config;
+  // Daily spend cap, checked before anything starts: every entry point (web, CLI, eval) runs here.
+  assertDailyBudget(deps.runsLog, cfg.AGENT_DAILY_BUDGET_USD, deps.now());
+  const claudeBin = deps.which('claude');
   if (!claudeBin) throw new Error('Claude Code CLI not found: install it and log in, or set ANTHROPIC_API_KEY');
-  const readOnly = !opts.allowChanges;
+  const { readOnly, mode: runMode } = agentMode(opts.allowChanges);
   const runId = opts.runId ?? randomUUID();
   const prompt_ = promptInfo();
-  const requestedModel = process.env.AGENT_MODEL ?? 'sonnet';
+  const requestedModel = cfg.AGENT_MODEL;
+  // Only invoices the user's own words name may be sent or cancelled (apps/mcp/src/write-guard.ts).
+  const allowedInvoices = readOnly ? [] : extractInvoiceRefs(prompt);
 
   mkdirSync(join(ROOT, 'data', 'state'), { recursive: true });
   const workDir = mkdtempSync(join(tmpdir(), 'oncade-agent-'));
   const mcpConfigFile = join(workDir, 'mcp.json');
-  writeFileSync(mcpConfigFile, JSON.stringify(mcpConfig({ readOnly, runId })));
+  writeFileSync(mcpConfigFile, JSON.stringify(mcpConfig({ readOnly, runId, allowedInvoices })));
 
+  // prettier-ignore
   const claudeArgs = [
     '-p', prompt,
     '--model', requestedModel,
@@ -197,18 +250,18 @@ export async function runAgent(prompt: string, opts: AgentOptions = {}): Promise
     ...(readOnly ? ['--disallowedTools', ...WRITE_TOOLS.map((t) => `mcp__oncade__${t}`)] : []),
     '--setting-sources', '',
     '--no-session-persistence',
-    '--max-turns', String(Number(process.env.AGENT_MAX_TURNS ?? 12)),
-    '--max-budget-usd', String(Number(process.env.AGENT_MAX_BUDGET_USD ?? 0.5)),
+    '--max-turns', String(cfg.AGENT_MAX_TURNS),
+    '--max-budget-usd', String(cfg.AGENT_MAX_BUDGET_USD),
     '--output-format', 'stream-json', '--verbose',
   ];
 
-  const mode = process.env.AGENT_SANDBOX ?? 'auto';
-  const bwrap = which('bwrap');
+  const mode = cfg.AGENT_SANDBOX;
+  const bwrap = deps.which('bwrap');
   const sandboxed = mode !== 'off' && !!bwrap;
   if (mode === 'on' && !bwrap) throw new Error('AGENT_SANDBOX=on but bwrap is not installed');
   if (!sandboxed) console.warn('[agent] running WITHOUT bwrap sandbox');
 
-  const env = agentEnv();
+  const env = agentEnv(cfg);
   const [cmd, args] = sandboxed
     ? [
         bwrap!,
@@ -237,13 +290,13 @@ export async function runAgent(prompt: string, opts: AgentOptions = {}): Promise
   try {
     let stderr = '';
     const lines = await new Promise<string[]>((ok, fail) => {
-      const p = spawn(cmd, args, { env: sandboxed ? {} : env, cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+      const p = deps.spawn(cmd, args, { env: sandboxed ? {} : env, cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
       let err = '';
       const timer = setTimeout(() => {
         timedOut = true;
         p.kill('SIGKILL');
-      }, Number(process.env.AGENT_TIMEOUT_MS ?? 180_000));
+      }, cfg.AGENT_TIMEOUT_MS);
       p.stdout.on('data', (d) => (out += d));
       p.stderr.on('data', (d) => (err += d));
       p.on('close', (code) => {
@@ -272,17 +325,25 @@ export async function runAgent(prompt: string, opts: AgentOptions = {}): Promise
       numTurns: final?.num_turns as number | undefined,
       sandboxed,
       runId,
-      mode: readOnly ? 'read-only' : 'allow-changes',
+      mode: runMode,
       model: parsed.model ?? requestedModel,
       promptVersion: prompt_.version,
     };
-    record(result, prompt_.sha256, opts.source ?? 'cli');
+    record(deps, result, prompt_.sha256, opts.source ?? 'cli');
     return result;
   } catch (e) {
     record(
+      deps,
       {
-        answer: '', toolCalls: [], isError: true, timedOut, sandboxed, runId,
-        mode: readOnly ? 'read-only' : 'allow-changes', model: requestedModel, promptVersion: prompt_.version,
+        answer: '',
+        toolCalls: [],
+        isError: true,
+        timedOut,
+        sandboxed,
+        runId,
+        mode: runMode,
+        model: requestedModel,
+        promptVersion: prompt_.version,
         durationMs: Date.now() - started,
       },
       prompt_.sha256,
@@ -294,9 +355,9 @@ export async function runAgent(prompt: string, opts: AgentOptions = {}): Promise
   }
 }
 
-function record(r: AgentResult, promptSha256: string, source: string) {
+function record(deps: AgentDeps, r: AgentResult, promptSha256: string, source: string) {
   const rec: RunRecord = {
-    ts: new Date().toISOString(),
+    ts: deps.now().toISOString(),
     runId: r.runId,
     source,
     mode: r.mode,
@@ -312,7 +373,7 @@ function record(r: AgentResult, promptSha256: string, source: string) {
     sandboxed: r.sandboxed,
   };
   try {
-    appendRun(process.env.RUNS_LOG ?? DEFAULT_RUNS_LOG, rec);
+    appendRun(deps.runsLog, rec);
   } catch (e) {
     console.warn(`[agent] could not write the run log: ${String(e)}`);
   }

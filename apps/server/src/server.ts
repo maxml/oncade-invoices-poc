@@ -1,10 +1,16 @@
-/** Entry point: load .env, refuse insecure defaults, start the app on 127.0.0.1. */
+/**
+ * Entry point: load and validate .env, refuse insecure defaults, then start two listeners on
+ * 127.0.0.1: the UI on PORT (never tunnelled) and the webhook receiver on WEBHOOK_PORT (the only
+ * port `pnpm tunnel` exposes).
+ */
+import { spawnSync } from 'node:child_process';
 import { loadEnv, securityConfig } from './env';
-import { buildApp } from './app';
+import { buildUiApp, buildWebhookApp } from './app';
 import { WebhookStore } from './webhook-store';
 import { runAgent } from '../../agent/src/run-agent';
+import { createOncadeClient } from '../../../packages/oncade-client/src/client';
 
-loadEnv();
+const config = loadEnv();
 let security;
 try {
   security = securityConfig(process.env);
@@ -16,15 +22,36 @@ if (security.insecureDefaults) {
   const bar = '!'.repeat(78);
   console.warn(
     `\n${bar}\n!! ALLOW_INSECURE_DEFAULTS=1: default admin password and/or session secret in use.\n` +
-      `!! Local demo only. Do not expose this server (no tunnel) in this mode.\n${bar}\n`,
+      `!! Local demo only.\n${bar}\n`,
   );
 }
 
-const app = await buildApp({
+// Health check client: one attempt, short timeout, so /healthz answers fast when Oncade is down.
+const healthClient = createOncadeClient({
+  apiKey: config.ONCADE_API_KEY,
+  businessId: config.ONCADE_BUSINESS_ID,
+  timeoutMs: 2_500,
+  maxAttempts: 1,
+});
+
+const ui = await buildUiApp({
   security,
   runAgent,
-  webhookSecret: process.env.ONCADE_WEBHOOK_SECRET ?? '',
+  health: {
+    oncade: () => healthClient.me(),
+    claude: () => {
+      const r = spawnSync('which', ['claude'], { encoding: 'utf8' });
+      return r.status === 0 ? r.stdout.trim() : null;
+    },
+  },
+  logger: true,
+});
+const webhooks = await buildWebhookApp({
+  webhookSecret: config.ONCADE_WEBHOOK_SECRET ?? '',
   webhookStore: new WebhookStore(process.env.WEBHOOK_LOG!),
   logger: true,
 });
-await app.listen({ port: Number(process.env.PORT ?? 3000), host: '127.0.0.1' });
+if (!config.ONCADE_WEBHOOK_SECRET) console.warn('[webhooks] ONCADE_WEBHOOK_SECRET is not set: every webhook will get 401');
+
+await ui.listen({ port: config.PORT, host: '127.0.0.1' });
+await webhooks.listen({ port: config.WEBHOOK_PORT, host: '127.0.0.1' });

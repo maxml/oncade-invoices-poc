@@ -5,7 +5,8 @@
  * passed as ONCADE_READ_ONLY):
  * - read-only (default): read tools plus `propose_invoice_change`. The write tools are not
  *   registered at all, so no text in a prompt or in API data can make the model call them.
- * - allow changes: the write tools (create / send / cancel) are registered as well.
+ * - allow changes: the write tools (create / send / cancel) are registered as well. Send and
+ *   cancel act only on invoices the user's request names or this run created (write-guard.ts).
  *
  * Every tool result is wrapped in a data envelope: the API's text (invoice notes, names, webhook
  * payloads) reaches the model as a JSON string value marked untrusted, never as bare text.
@@ -15,6 +16,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { OncadeError, type OncadeClient } from '../../../packages/oncade-client/src/client';
 import { getOrCreateLinkSession } from './link-session';
+import { WriteGuard } from './write-guard';
 
 export const READ_TOOLS = [
   'get_platform',
@@ -33,6 +35,11 @@ export interface ToolOptions {
   readOnly: boolean;
   webhookLog: string;
   linkSessionCache: string;
+  /**
+   * Allow-changes mode: invoice ids / numbers named in the user's request (see write-guard.ts).
+   * Send and cancel are refused for anything else that this run did not create. Default: none.
+   */
+  allowedInvoices?: string[];
 }
 
 const ENVELOPE_NOTE =
@@ -99,9 +106,7 @@ export function buildServer(client: OncadeClient, opts: ToolOptions): McpServer 
         'Get a link the business admin opens to grant invoice scopes. Use only when invoice calls fail with SCOPE_NOT_GRANTED; return the URL to the user. A link created in the last 30 minutes is reused.',
     },
     () =>
-      tool(() =>
-        getOrCreateLinkSession(opts.linkSessionCache, INVOICE_SCOPES, () => client.createLinkSession(INVOICE_SCOPES)),
-      ),
+      tool(() => getOrCreateLinkSession(opts.linkSessionCache, INVOICE_SCOPES, () => client.createLinkSession(INVOICE_SCOPES))),
   );
 
   server.registerTool(
@@ -142,6 +147,8 @@ export function buildServer(client: OncadeClient, opts: ToolOptions): McpServer 
     return server;
   }
 
+  const guard = new WriteGuard(opts.allowedInvoices ?? [], (id) => client.getInvoice(id));
+
   server.registerTool(
     'create_draft_invoice',
     {
@@ -157,22 +164,39 @@ export function buildServer(client: OncadeClient, opts: ToolOptions): McpServer 
           .min(1),
       },
     },
-    (a) => tool(() => client.createDraftInvoice(a)),
+    (a) =>
+      tool(async () => {
+        const created = await client.createDraftInvoice(a);
+        guard.recordCreated(created);
+        return created;
+      }),
   );
+
+  /** Run a send/cancel only if the guard allows this invoice; otherwise an error envelope saying why. */
+  const guarded = async (invoiceId: string, action: () => Promise<unknown>) => {
+    const d = await guard.check(invoiceId);
+    if (!d.allowed) return envelope({ refused: true, invoiceId, reason: d.reason, ...guard.describe() }, true);
+    return tool(action);
+  };
 
   server.registerTool(
     'send_invoice',
     {
-      description: 'Move a draft invoice to sent. Email delivery is off unless sendEmail=true.',
+      description:
+        'Move a draft invoice to sent. Email delivery is off unless sendEmail=true. Only for an invoice the user named in this request, or one created in this run; others are refused.',
       inputSchema: { invoiceId: z.string(), sendEmail: z.boolean().optional() },
     },
-    (a) => tool(() => client.sendInvoice(a.invoiceId, a.sendEmail ?? false)),
+    (a) => guarded(a.invoiceId, () => client.sendInvoice(a.invoiceId, a.sendEmail ?? false)),
   );
 
   server.registerTool(
     'cancel_invoice',
-    { description: 'Cancel a draft or sent invoice. Terminal.', inputSchema: { invoiceId: z.string() } },
-    (a) => tool(() => client.cancelInvoice(a.invoiceId)),
+    {
+      description:
+        'Cancel a draft or sent invoice. Terminal. Only for an invoice the user named in this request, or one created in this run; others are refused.',
+      inputSchema: { invoiceId: z.string() },
+    },
+    (a) => guarded(a.invoiceId, () => client.cancelInvoice(a.invoiceId)),
   );
 
   return server;

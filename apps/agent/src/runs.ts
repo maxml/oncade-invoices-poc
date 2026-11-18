@@ -42,6 +42,32 @@ export function readRuns(file: string, n = 20): RunRecord[] {
   return out.slice(-n);
 }
 
+/** Sum of `costUsd` of the runs logged on the same UTC day as `now`. */
+export function spentToday(file: string, now: Date): number {
+  const day = now.toISOString().slice(0, 10);
+  return readRuns(file, Infinity)
+    .filter((r) => r.ts.slice(0, 10) === day)
+    .reduce((s, r) => s + (typeof r.costUsd === 'number' && Number.isFinite(r.costUsd) ? r.costUsd : 0), 0);
+}
+
+export class BudgetExceededError extends Error {
+  constructor(
+    readonly spentUsd: number,
+    readonly capUsd: number,
+  ) {
+    super(
+      `Daily agent budget of $${capUsd.toFixed(2)} reached ($${spentUsd.toFixed(2)} spent today, UTC). ` +
+        'Raise AGENT_DAILY_BUDGET_USD in .env or try again tomorrow.',
+    );
+  }
+}
+
+/** Throws BudgetExceededError when today's logged spend has reached the cap. */
+export function assertDailyBudget(file: string, capUsd: number, now: Date): void {
+  const spent = spentToday(file, now);
+  if (spent >= capUsd) throw new BudgetExceededError(spent, capUsd);
+}
+
 export function formatRuns(runs: RunRecord[]): string {
   const rows = runs.map((r) =>
     [
