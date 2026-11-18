@@ -120,13 +120,60 @@ else
   CAN_WEBHOOKS=0
 fi
 
+NGROK_HINT="ngrok config add-authtoken <token>   (token: https://dashboard.ngrok.com/get-started/your-authtoken)"
+
+# Does ngrok's authtoken actually work? Starts a tunnel to 127.0.0.1:65530 (nothing listens there,
+# so nothing is exposed) for up to 8 s, reads only the status out of its log, then kills that exact
+# PID. Prints "ok", "ERR_NGROK_<n>" or "unknown". The log is never shown (it may name the token).
+ngrok_probe() {
+  local log pid result=unknown
+  log="$(mktemp)" || {
+    echo unknown
+    return
+  }
+  ngrok http 127.0.0.1:65530 --log stdout --log-format json >"$log" 2>&1 </dev/null &
+  pid=$!
+  for _ in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    if grep -qE '"msg":"started tunnel"|"url":"https://' "$log"; then
+      result=ok
+      break
+    fi
+    if grep -qE 'ERR_NGROK_[0-9]+' "$log"; then
+      result="$(grep -oE 'ERR_NGROK_[0-9]+' "$log" | head -n 1)"
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break # exited without a status we know
+  done
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$log"
+  echo "$result"
+}
+
 if have ngrok; then
-  ngrok_cfg="$(ngrok config check 2>/dev/null | sed -n 's/^Valid configuration file at //p' || true)"
-  if [ -n "$ngrok_cfg" ] && grep -q 'authtoken:' "$ngrok_cfg" 2>/dev/null; then
-    ok "ngrok with an authtoken"
-  else
-    opt "ngrok has no authtoken" "ngrok config add-authtoken <token from dashboard.ngrok.com>"
+  if ! ngrok config check >/dev/null 2>&1; then
+    bad "ngrok config is invalid (ngrok config check fails)" "$NGROK_HINT"
     CAN_WEBHOOKS=0
+  else
+    probe="$(ngrok_probe)"
+    case "$probe" in
+      ok) ok "ngrok authtoken works (a test tunnel started and was stopped)" ;;
+      ERR_NGROK_*)
+        bad "ngrok authtoken rejected ($probe, https://ngrok.com/docs/errors/$(echo "$probe" | tr '[:upper:]' '[:lower:]'))" "$NGROK_HINT"
+        CAN_WEBHOOKS=0
+        ;;
+      *)
+        printf '  ? %s\n      if pnpm tunnel fails with ERR_NGROK_...: %s\n' \
+          "ngrok authtoken: could not verify (no network, or ngrok gave no answer in 8 s)" "$NGROK_HINT"
+        ;;
+    esac
+    unset probe
   fi
 else
   opt "ngrok not found (needed for webhooks: pnpm tunnel)" \

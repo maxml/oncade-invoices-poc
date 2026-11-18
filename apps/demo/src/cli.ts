@@ -2,7 +2,6 @@
 import { existsSync } from 'node:fs';
 import { connect } from 'node:net';
 import { resolve } from 'node:path';
-import { OncadeError } from '../../../packages/oncade-client/src/client';
 import { runDemo } from './demo';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
@@ -30,8 +29,8 @@ try {
   });
   process.exit(code);
 } catch (e) {
-  console.error(e instanceof OncadeError ? `Oncade API error: ${e.message}` : e);
-  if (e instanceof OncadeError && JSON.stringify(e.body).includes('SCOPE_NOT_GRANTED'))
-    console.error('The key lacks invoice scopes: a business admin must approve them (see README, Oncade issues).');
+  // Oncade API errors are reported by runDemo itself; this is anything else (network, a bug).
+  console.error(e);
+  console.error(`Demo FAILED: ${e instanceof Error ? e.message : String(e)}`);
   process.exit(1);
 }

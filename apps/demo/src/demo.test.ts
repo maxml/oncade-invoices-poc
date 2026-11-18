@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { runDemo, type DemoDeps } from './demo';
 
 const ENV = { ONCADE_API_KEY: 'oncade_platform_test_fake', ONCADE_BUSINESS_ID: 'biz_1' };
+const FINISHED = 'Demo finished: the invoice flow worked (draft, send, cancel, read back).';
 
 type Call = { method: string; path: string; headers: Record<string, string>; body: any };
 
@@ -76,8 +77,16 @@ describe('runDemo', () => {
     expect(new Set(keys).size).toBe(4);
     expect(t.text()).toMatch(/5\. GET A: +id=inv_1 number=INV-1 status=sent/);
     expect(t.text()).toMatch(/GET B: +id=inv_2 number=INV-2 status=cancelled/);
-    expect(t.text()).toContain('ONCADE_WEBHOOK_SECRET is not set');
-    expect(t.text()).toContain('pnpm tunnel');
+    // Skipping webhooks reads as a success: step 6, then the success line, then the optional how-to.
+    const tail = t.lines.slice(t.lines.findIndex((l) => l.startsWith('6. ')));
+    expect(tail.slice(0, 4)).toEqual([
+      '6. Webhooks (optional): not checked, ONCADE_WEBHOOK_SECRET is not set.',
+      '',
+      FINISHED,
+      '',
+    ]);
+    expect(tail[4]).toMatch(/^Optional, to see the webhooks too: .*pnpm tunnel/);
+    expect(t.text()).not.toMatch(/FAILED|skipped/);
 
     // Same run id, same requests: the same keys (Oncade's idempotency makes a re-run a no-op).
     const again = setup();
@@ -94,7 +103,23 @@ describe('runDemo', () => {
     };
     expect(await runDemo(t.deps)).toBe(0);
     expect(probed).toBe(4555);
-    expect(t.text()).toContain('no receiver on 127.0.0.1:4555');
+    expect(t.lines).toContain('6. Webhooks (optional): not checked, no receiver running on 127.0.0.1:4555.');
+    expect(t.lines.indexOf(FINISHED)).toBeGreaterThan(t.lines.findIndex((l) => l.startsWith('6. ')));
+    expect(t.text()).not.toContain('FAILED');
+  });
+
+  it('on an Oncade API error stops, prints a Demo FAILED line, exit 1', async () => {
+    const t = setup();
+    const ok = t.deps.fetch!;
+    t.deps.fetch = (async (url: string, init: any) =>
+      url.endsWith('/cancel')
+        ? new Response(JSON.stringify({ error: 'SCOPE_NOT_GRANTED' }), { status: 403 })
+        : ok(url, init)) as unknown as typeof fetch;
+    expect(await runDemo(t.deps)).toBe(1);
+    expect(t.text()).toMatch(/^Demo FAILED: Oncade API error: .*403/m);
+    expect(t.text()).toContain('The key lacks invoice scopes');
+    expect(t.text()).not.toContain(FINISHED);
+    expect(t.text()).not.toMatch(/^[56]\. /m);
   });
 
   it('waits for the four webhooks of exactly these invoices and prints them', async () => {
@@ -121,6 +146,7 @@ describe('runDemo', () => {
     ]);
     expect(t.text()).not.toContain('other_inv');
     expect(t.text()).toContain('all four webhooks arrived');
+    expect(t.lines.at(-1)).toBe(FINISHED);
     expect(sleeps).toBe(2);
   });
 
@@ -135,6 +161,8 @@ describe('runDemo', () => {
       'timed out after 3 s; missing: Platform.Invoice.Sent inv_1, Platform.Invoice.Created inv_2, Platform.Invoice.Cancelled inv_2.',
     );
     expect(t.text()).toContain('Check that `pnpm tunnel` is up');
+    expect(t.lines).toContain('Demo FAILED: the invoice flow worked, but the webhooks did not arrive within 3 s.');
+    expect(t.text()).not.toContain(FINISHED);
   });
 
   it('without the Oncade variables names them and calls nothing; LLM and admin settings are not needed', async () => {
@@ -144,6 +172,7 @@ describe('runDemo', () => {
     expect(t.text()).toContain('ONCADE_API_KEY: is required');
     expect(t.text()).toContain('ONCADE_BUSINESS_ID: is required');
     expect(t.text()).toContain('cp .env.example .env');
+    expect(t.text()).toContain('Demo FAILED: required settings are missing.');
     expect(t.text()).not.toMatch(/AGENT_SANDBOX|ANTHROPIC|ADMIN_PASSWORD|WEBHOOK_PORT/);
   });
 });

@@ -5,7 +5,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { ConfigError, parseOncadeConfig } from '../../../packages/config/src/config';
-import { createOncadeClient } from '../../../packages/oncade-client/src/client';
+import { createOncadeClient, OncadeError } from '../../../packages/oncade-client/src/client';
 
 export interface DemoDeps {
   env: Record<string, string | undefined>;
@@ -34,6 +34,7 @@ export async function runDemo(d: DemoDeps): Promise<number> {
     d.out(e.message);
     d.out('The demo needs only ONCADE_API_KEY (oncade_platform_test_...) and ONCADE_BUSINESS_ID in .env.');
     d.out('Start with: cp .env.example .env   (or run ./scripts/doctor.sh)');
+    d.out('Demo FAILED: required settings are missing.');
     return 1;
   }
   const client = createOncadeClient({
@@ -58,23 +59,37 @@ export async function runDemo(d: DemoDeps): Promise<number> {
   };
 
   d.out(`Oncade invoices demo, run ${d.runId} (test environment)`);
-  const a = await create('to send');
-  d.out(`1. Created draft A:      ${a.text}`);
-  d.out(`2. Sent A (no email):    ${show(await client.sendInvoice(a.id, false)).text}`);
-  const b = await create('to cancel');
-  d.out(`3. Created draft B:      ${b.text}`);
-  d.out(`4. Cancelled B:          ${show(await client.cancelInvoice(b.id)).text}`);
-  d.out(`5. GET A:                ${show(await client.getInvoice(a.id)).text}`);
-  d.out(`   GET B:                ${show(await client.getInvoice(b.id)).text}`);
+  let a, b;
+  try {
+    a = await create('to send');
+    d.out(`1. Created draft A:      ${a.text}`);
+    d.out(`2. Sent A (no email):    ${show(await client.sendInvoice(a.id, false)).text}`);
+    b = await create('to cancel');
+    d.out(`3. Created draft B:      ${b.text}`);
+    d.out(`4. Cancelled B:          ${show(await client.cancelInvoice(b.id)).text}`);
+    d.out(`5. GET A:                ${show(await client.getInvoice(a.id)).text}`);
+    d.out(`   GET B:                ${show(await client.getInvoice(b.id)).text}`);
+  } catch (e) {
+    if (!(e instanceof OncadeError)) throw e;
+    d.out(`Demo FAILED: Oncade API error: ${e.message}`);
+    if (JSON.stringify(e.body).includes('SCOPE_NOT_GRANTED'))
+      d.out('The key lacks invoice scopes: a business admin must approve them (see README, Oncade issues).');
+    return 1;
+  }
 
+  const FINISHED = 'Demo finished: the invoice flow worked (draft, send, cancel, read back).';
   const port = cfg.WEBHOOK_PORT;
   if (!cfg.ONCADE_WEBHOOK_SECRET || !(await d.receiverUp(port))) {
     d.out(
-      `6. Webhooks: skipped (${cfg.ONCADE_WEBHOOK_SECRET ? `no receiver on 127.0.0.1:${port}` : 'ONCADE_WEBHOOK_SECRET is not set'}).`,
+      `6. Webhooks (optional): not checked, ${cfg.ONCADE_WEBHOOK_SECRET ? `no receiver running on 127.0.0.1:${port}` : 'ONCADE_WEBHOOK_SECRET is not set'}.`,
     );
-    d.out('   To see them: run `pnpm dev` (receiver on WEBHOOK_PORT) and `pnpm tunnel` (ngrok), set the webhook');
-    d.out('   URL https://<ngrok-host>/webhooks/oncade in dev.oncade.xyz Platform Settings, put its secret in');
-    d.out('   ONCADE_WEBHOOK_SECRET in .env, restart `pnpm dev`, then run `pnpm demo` again.');
+    d.out('');
+    d.out(FINISHED);
+    d.out('');
+    d.out('Optional, to see the webhooks too: run `pnpm dev` (receiver on WEBHOOK_PORT) and `pnpm tunnel`');
+    d.out('(ngrok), set the webhook URL https://<ngrok-host>/webhooks/oncade in dev.oncade.xyz Platform');
+    d.out('Settings, put its secret in ONCADE_WEBHOOK_SECRET in .env, restart `pnpm dev`, then run');
+    d.out('`pnpm demo` again.');
     return 0;
   }
 
@@ -97,15 +112,19 @@ export async function runDemo(d: DemoDeps): Promise<number> {
       }
     }
     if (seen.size === wanted.length) {
-      d.out('Done: all four webhooks arrived and were verified by the receiver.');
+      d.out('   all four webhooks arrived and were verified by the receiver.');
+      d.out('');
+      d.out(FINISHED);
       return 0;
     }
     if (waited >= waitMs) break;
     await sleep(1000);
   }
-  d.out(`Webhooks: timed out after ${waitMs / 1000} s; missing: ${wanted.filter((w) => !seen.has(w)).join(', ')}.`);
-  d.out('   The invoices above are fine. Check that `pnpm tunnel` is up, that the webhook URL in Platform Settings');
-  d.out('   is the current ngrok host + /webhooks/oncade, and that `pnpm dev` logs no "bad signature" (wrong secret).');
+  d.out(`   Webhooks timed out after ${waitMs / 1000} s; missing: ${wanted.filter((w) => !seen.has(w)).join(', ')}.`);
+  d.out('');
+  d.out(`Demo FAILED: the invoice flow worked, but the webhooks did not arrive within ${waitMs / 1000} s.`);
+  d.out('Check that `pnpm tunnel` is up, that the webhook URL in Platform Settings is the current ngrok host');
+  d.out('+ /webhooks/oncade, and that `pnpm dev` logs no "bad signature" (wrong secret).');
   return 1;
 }
 
