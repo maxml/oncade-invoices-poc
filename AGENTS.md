@@ -17,8 +17,12 @@ receiver. See `README.md` for the architecture and how to run it.
 ```bash
 pnpm install
 pnpm dev                     # Fastify app + webhook receiver on 127.0.0.1:$PORT (default 3000)
-pnpm ask "<question>"        # one agent turn from the terminal
-pnpm mcp                     # the Oncade MCP server on stdio (for any MCP client)
+                             # needs ADMIN_PASSWORD + SESSION_SECRET (or ALLOW_INSECURE_DEFAULTS=1)
+pnpm ask "<question>"        # one agent turn from the terminal (read-only)
+pnpm ask --allow-changes "<question>"   # with create/send/cancel tools
+pnpm runs                    # last agent runs from data/runs.jsonl
+pnpm eval                    # eval cases through the real agent (costs ~$0.06), see README PromptOps
+pnpm mcp                     # the Oncade MCP server on stdio (read-only unless ONCADE_READ_ONLY=0)
 pnpm tunnel                  # ngrok http 3000, to receive real webhooks
 pnpm test                    # vitest
 pnpm typecheck               # tsc --noEmit
@@ -37,10 +41,19 @@ pnpm typecheck               # tsc --noEmit
 - **MUST** keep the agent's tool surface to the `oncade` MCP server: no built-in tools, no user or
   project settings (`--tools ""`, `--strict-mcp-config`, `--setting-sources ""`).
 - **MUST NOT** widen the sandbox (`apps/agent/src/run-agent.ts`) without a reason written next to
-  the bind that needs it. The agent sees read-only system dirs and code, a private `/tmp`, the
-  network, and from `$HOME` only the Claude Code credentials file.
+  the bind that needs it. The agent sees read-only `/usr` and code, a short list of `/etc` files
+  (`ETC_FILES`), a private `/tmp`, writable `data/state/` only, the network, and from `$HOME`
+  only the Claude Code credentials file, and that only when `ANTHROPIC_API_KEY` is not set.
+- **MUST** keep write tools (create / send / cancel) out of read-only runs at the tool boundary:
+  the MCP server does not register them unless `ONCADE_READ_ONLY=0`, and only the server or CLI
+  decides that, from the user's explicit choice. Never from model output or API data.
+- **MUST** keep every tool result inside the `envelope()` in `apps/mcp/src/tools.ts`.
 - **MUST** make the agent state only facts that came from a tool result in that run
   (`apps/agent/prompts/system.md`). Sending or cancelling an invoice happens only when the user asks.
+- **MUST** add a `prompts/CHANGELOG.md` entry (new version, new hash) for any change to
+  `system.md`, and run `pnpm eval` after it; record the result in the README.
+- **MUST** put a new guard where a bad value cannot get through, with a test that was seen
+  failing with the guard removed.
 - **SHOULD** keep it small: no new frameworks; prefer the platform (Node 24 built-ins) and the
   existing deps.
 - **SHOULD** write everything in this repo in English.
@@ -53,7 +66,7 @@ pnpm typecheck               # tsc --noEmit
   `sed -E 's/=.+/=<set>/' .env`.
 - Never paste keys into prompts, commit messages, test fixtures or the README. Test secrets in
   tests are obviously fake (`whsec_test`).
-- `data/webhooks.jsonl` holds received events and is gitignored.
+- `data/` (webhooks, runs log, link-session cache) is gitignored.
 
 ## Trust
 

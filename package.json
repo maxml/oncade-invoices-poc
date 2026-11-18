@@ -11,6 +11,8 @@
     "dev": "tsx apps/server/src/server.ts",
     "ask": "tsx apps/agent/src/cli.ts",
     "mcp": "tsx apps/mcp/src/server.ts",
+    "runs": "tsx apps/agent/src/runs-cli.ts",
+    "eval": "tsx evals/run.ts",
     "tunnel": "ngrok http 3000",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
