@@ -16,7 +16,11 @@ security model, tests, evals and the production checklist.
 ## Commands
 
 ```bash
+./scripts/doctor.sh          # what this machine can run; never prints values; --fix asks y/N per step
+                             # (`pnpm run doctor`; plain `pnpm doctor` is pnpm's built-in)
 pnpm install
+pnpm demo                    # create+send, create+cancel, GET, webhooks if set up; Oncade key only, no LLM
+                             # (each run creates two $1 test invoices)
 pnpm dev                     # UI on 127.0.0.1:$PORT (3000), webhook receiver on 127.0.0.1:$WEBHOOK_PORT (3001)
                              # needs ADMIN_PASSWORD + SESSION_SECRET (or ALLOW_INSECURE_DEFAULTS=1)
 pnpm ask "<question>"        # one agent turn from the terminal (read-only)

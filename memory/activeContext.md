@@ -1,6 +1,16 @@
 # Active context
 
-## State (2026-11-18, after verification round 3)
+## State (2026-11-18, reviewer onboarding)
+
+- `pnpm demo` (`apps/demo`): the invoice flow on the API client alone, no LLM; validates only the
+  Oncade part of the config (`parseOncadeConfig`). Run for real without the webhook receiver:
+  A `6afd631504c10f21fe8b8c62` sent, B `6afd631604c10f21fe8b8c7e` cancelled. The 60 s webhook
+  wait is tested only against a fake log; not yet run with a real tunnel.
+- `scripts/doctor.sh` (`pnpm run doctor`; `pnpm doctor` is pnpm's built-in and does not run it).
+- README "Start here" and a curl block (run as written against the test API: works).
+- `pnpm test`: 193 tests in 11 files.
+
+## Earlier: after verification round 3
 
 - Round 3 (independent verifier on ab1acbe): every earlier mutation re-applied and killed; new
   findings fixed with tests seen red first (docs/solution.md, Verification rounds): non-ASCII

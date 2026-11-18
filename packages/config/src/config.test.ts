@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, parseConfig } from './config';
+import { ConfigError, parseConfig, parseOncadeConfig } from './config';
 
 const base = { ONCADE_API_KEY: 'oncade_platform_test_fake', ONCADE_BUSINESS_ID: 'biz' };
 
@@ -61,5 +61,25 @@ describe('parseConfig', () => {
   it('refuses a negative daily budget but allows 0 (all runs blocked)', () => {
     expect(problems({ ...base, AGENT_DAILY_BUDGET_USD: '-1' })).toHaveLength(1);
     expect(parseConfig({ ...base, AGENT_DAILY_BUDGET_USD: '0' }).AGENT_DAILY_BUDGET_USD).toBe(0);
+  });
+});
+
+describe('parseOncadeConfig (pnpm demo)', () => {
+  it('keeps only the Oncade part and ignores agent, LLM and admin settings, even invalid ones', () => {
+    const c = parseOncadeConfig({ ...base, AGENT_SANDBOX: 'maybe', PORT: '3001', ANTHROPIC_API_KEY: 'x' });
+    expect(c).toEqual({ ONCADE_API_KEY: base.ONCADE_API_KEY, ONCADE_BUSINESS_ID: 'biz', WEBHOOK_PORT: 3001 });
+  });
+
+  it('applies the same Oncade rules: test key only, both variables required', () => {
+    expect(() => parseOncadeConfig({ ...base, ONCADE_API_KEY: 'oncade_platform_live_x' })).toThrow(/TEST platform key/);
+    try {
+      parseOncadeConfig({ ONCADE_API_KEY: '' });
+      expect.fail('should throw');
+    } catch (e) {
+      expect((e as ConfigError).problems).toEqual([
+        'ONCADE_API_KEY: is required (an Oncade test platform key, see .env.example)',
+        'ONCADE_BUSINESS_ID: is required (shown in the developer portal)',
+      ]);
+    }
   });
 });

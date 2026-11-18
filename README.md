@@ -6,6 +6,50 @@ invoice for Acme, 10 hours at $50", "Show my last 5 invoices"), and an agent ans
 the Oncade API through an MCP server, sandboxed. An **Allow changes** box (off by default) decides
 whether it may create, send or cancel in that run.
 
+## Start here
+
+About five minutes, Linux or macOS, no LLM needed until step 4.
+
+1. `./scripts/doctor.sh` checks Node 24+, pnpm 9, dependencies and `.env` (it never prints
+   values) and says what you can run. `--fix` offers the safe local steps (corepack enable,
+   `pnpm install`, `cp .env.example .env`), asking first. `pnpm run doctor` does the same
+   (plain `pnpm doctor` is pnpm's own built-in command).
+2. `pnpm install && pnpm test`: no keys, no network.
+3. `pnpm demo`: needs only `ONCADE_API_KEY` (`oncade_platform_test_...`) and `ONCADE_BUSINESS_ID`
+   in `.env`. It creates a $1 draft for `demo@example.com` and sends it without email, creates a
+   second draft and cancels it, reads both back and prints each id and status.
+4. Optional, the UI and the agent: `pnpm dev` (see [Quick start](#quick-start)).
+5. Optional, webhooks: [set them up](#webhooks), keep `pnpm dev` running, and `pnpm demo` waits up
+   to 60 s for `Platform.Invoice.Created`, `Sent` and `Cancelled` of its own invoices.
+
+### Check it yourself with curl
+
+What `pnpm demo` does, against the same API (needs `jq`; macOS 15+ ships it):
+
+```bash
+API=https://www.oncade.gg/api/v1/platform
+H=(-H "Authorization: Bearer $ONCADE_API_KEY" -H "X-Oncade-API-Version: v1"
+   -H "X-Target-Business-Id: $ONCADE_BUSINESS_ID" -H "Content-Type: application/json")
+key() { echo "Idempotency-Key: $(uuidgen | tr 'A-Z' 'a-z')"; }   # writes need a UUID
+DRAFT=$(printf '{"receiverName":"curl demo","receiverEmail":"demo@example.com","date":"%s",
+  "payToTarget":"BUSINESS","items":[{"description":"Demo item","quantity":1,"rate":1,"amount":1}]}' "$(date +%F)")
+
+# 1. Create a draft and keep its _id
+A=$(curl -sS "${H[@]}" -H "$(key)" -d "$DRAFT" "$API/invoices" | jq -r ._id); echo "draft $A"
+# 2. Send it without email
+curl -sS "${H[@]}" -H "$(key)" -d '{"sendEmail":false}' "$API/invoices/$A/send" | jq '{_id,status}'
+# 3. A second draft, cancelled
+B=$(curl -sS "${H[@]}" -H "$(key)" -d "$DRAFT" "$API/invoices" | jq -r ._id)
+curl -sS "${H[@]}" -H "$(key)" -X POST "$API/invoices/$B/cancel" | jq '{_id,status}'
+# 4. Read one back, then list the latest
+curl -sS "${H[@]}" "$API/invoices/$A" | jq '{_id,invoiceNumber,status,total}'
+curl -sS "${H[@]}" "$API/invoices?limit=5" | jq '[.invoices[] | {_id,status}]'
+```
+
+Export the two variables first (`export ONCADE_API_KEY=... ONCADE_BUSINESS_ID=...`). The demo
+derives its Idempotency-Keys from the run and the request instead of `uuidgen`, so a retry within
+a run cannot create a second invoice.
+
 ![One screen: a question, the agent's answer, the tools it called, sandbox flag, time and cost](docs/screenshot.png)
 
 Design, security model, tests, evals and the production checklist: [docs/solution.md](docs/solution.md).
@@ -42,7 +86,7 @@ From the terminal: `pnpm ask "Show my last 5 invoices"` (read-only) or
 ## Checks
 
 ```bash
-pnpm test           # 186 tests, no network, no secrets
+pnpm test           # 193 tests, no network, no secrets
 pnpm lint           # ESLint (typescript-eslint); pnpm format:check for Prettier
 pnpm typecheck      # TypeScript 7
 pnpm eval           # 11 eval cases through the real agent (Sonnet, sandboxed), about $0.14

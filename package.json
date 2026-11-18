@@ -8,6 +8,8 @@
     "node": ">=24"
   },
   "scripts": {
+    "doctor": "bash scripts/doctor.sh",
+    "demo": "tsx apps/demo/src/cli.ts",
     "dev": "tsx apps/server/src/server.ts",
     "ask": "tsx apps/agent/src/cli.ts",
     "mcp": "tsx apps/mcp/src/server.ts",

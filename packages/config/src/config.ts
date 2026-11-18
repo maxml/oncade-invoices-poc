@@ -12,17 +12,21 @@ const optional = () => z.preprocess(unsetIfEmpty, z.string().optional());
 const withDefault = <T extends z.ZodType>(schema: T) => z.preprocess(unsetIfEmpty, schema);
 const port = (def: number) => withDefault(z.coerce.number().int().min(1).max(65535).default(def));
 
+// Oncade (test environment only). Shared by the full schema and the Oncade-only one below.
+const oncadeShape = {
+  ONCADE_API_KEY: z.preprocess(
+    unsetIfEmpty,
+    z
+      .string({ error: 'is required (an Oncade test platform key, see .env.example)' })
+      .startsWith('oncade_platform_test_', 'must be an Oncade TEST platform key (oncade_platform_test_...)'),
+  ),
+  ONCADE_BUSINESS_ID: z.preprocess(unsetIfEmpty, z.string({ error: 'is required (shown in the developer portal)' })),
+  ONCADE_WEBHOOK_SECRET: optional(),
+};
+
 export const ConfigSchema = z
   .object({
-    // Oncade (test environment only)
-    ONCADE_API_KEY: z.preprocess(
-      unsetIfEmpty,
-      z
-        .string({ error: 'is required (an Oncade test platform key, see .env.example)' })
-        .startsWith('oncade_platform_test_', 'must be an Oncade TEST platform key (oncade_platform_test_...)'),
-    ),
-    ONCADE_BUSINESS_ID: z.preprocess(unsetIfEmpty, z.string({ error: 'is required (shown in the developer portal)' })),
-    ONCADE_WEBHOOK_SECRET: optional(),
+    ...oncadeShape,
 
     // Agent
     ANTHROPIC_API_KEY: optional(),
@@ -67,9 +71,26 @@ export class ConfigError extends Error {
   }
 }
 
-/** Parse and validate; throws ConfigError listing every bad variable by name. */
-export function parseConfig(env: Record<string, string | undefined>): Config {
-  const r = ConfigSchema.safeParse(env);
+/**
+ * Only what talks to Oncade and listens for its webhooks: no LLM, admin or agent settings, so
+ * `pnpm demo` runs with an Oncade test key alone, whatever else is (or is not) in .env.
+ */
+export const OncadeOnlySchema = z.object({ ...oncadeShape, WEBHOOK_PORT: port(3001) });
+
+export type OncadeOnlyConfig = z.infer<typeof OncadeOnlySchema>;
+
+function parseWith<T extends z.ZodType>(schema: T, env: Record<string, string | undefined>): z.infer<T> {
+  const r = schema.safeParse(env);
   if (r.success) return r.data;
   throw new ConfigError(r.error.issues.map((i) => `${i.path.join('.') || '(env)'}: ${i.message}`));
+}
+
+/** Parse and validate; throws ConfigError listing every bad variable by name. */
+export function parseConfig(env: Record<string, string | undefined>): Config {
+  return parseWith(ConfigSchema, env);
+}
+
+/** The Oncade part only (see OncadeOnlySchema); other variables are ignored, even invalid ones. */
+export function parseOncadeConfig(env: Record<string, string | undefined>): OncadeOnlyConfig {
+  return parseWith(OncadeOnlySchema, env);
 }
