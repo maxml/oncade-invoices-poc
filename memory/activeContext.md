@@ -69,7 +69,8 @@
 - Zod reports the PORT / WEBHOOK_PORT clash only once every field is valid.
 
 - Oncade: "Mark as paid" in the dashboard emits no `Platform.Invoice.Paid` webhook; failed webhook
-  deliveries are not retried automatically (only manual Resend).
+  deliveries are retried for only about two minutes (three attempts: e.g. #1 404, #2 404, #3
+  status 0, then nothing), and the retry policy is not documented.
 
 ## Fixed
 

@@ -1,6 +1,6 @@
 /** `pnpm ask [--allow-changes] "<question>"`: one agent turn from the terminal. Returns the exit code. */
 import type { AgentOptions, AgentResult } from './run-agent';
-import { BudgetExceededError, BudgetLedgerError } from './runs';
+import { BudgetExceededError, BudgetLedgerError } from './budget';
 
 export interface AskDeps {
   runAgent: (prompt: string, opts: AgentOptions) => Promise<AgentResult>;

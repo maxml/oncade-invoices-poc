@@ -58,9 +58,24 @@ the PromptOps loop.
 | `packages/oncade-client` | Typed Platform API client (test keys only, timeouts, retries, deterministic idempotency keys), webhook verifier |
 | `packages/config`        | The whole environment as one Zod schema; every entry point reads settings from it                               |
 | `apps/mcp`               | Invoice tools as an MCP stdio server; read-only unless told otherwise; the write guard                          |
-| `apps/agent`             | `runAgent` (one sandboxed turn of `claude -p`), `pnpm ask`, the run log, the system prompt                      |
+| `apps/agent`             | `runAgent` (one sandboxed turn of `claude -p`), `pnpm ask`, the run log, the daily budget, the system prompt    |
 | `apps/server`            | The UI app and the webhook app, and the entry point that serves them on two ports                               |
 | `evals`                  | Eval cases, deterministic grader, runner, committed results                                                     |
+
+Inside `apps/agent/src`, one file per concern:
+
+| File               | What it does                                                                                               |
+| ------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `run-agent.ts`     | `runAgent`: reserves the budget, writes the MCP config, starts the CLI, builds the result, settles the run |
+| `request-scope.ts` | `agentMode()` (the only place the mode is decided) and the invoices and emails the request allows          |
+| `mcp-config.ts`    | The `oncade` MCP server config for one run (mode and permissions in its env) and the write tool names      |
+| `sandbox.ts`       | bwrap arguments, `ETC_FILES`, and the allowlisted env the agent gets                                       |
+| `cli-process.ts`   | Starts the CLI, collects stdout and stderr, kills it at the timeout                                        |
+| `stream-parser.ts` | `parseAgentStream` (tool calls, result event, model) and the answer / error status of a run                |
+| `budget.ts`        | The daily cap: `spentToday`, the reservation ledger and its lock, `reserveBudget`, `settleBudget`, errors  |
+| `runs-log.ts`      | `data/runs.jsonl`: `RunRecord`, append, read, `formatRuns` (`pnpm runs`)                                   |
+| `ask.ts`, `cli.ts` | `pnpm ask`                                                                                                 |
+| `prompt.ts`        | The system prompt's version and hash                                                                       |
 
 The two ports are the structural fix for exposure. Earlier the login page and the webhook receiver
 shared one port and a header check decided what a tunnelled request could reach. Now the tunnel
@@ -113,7 +128,7 @@ Everything comes from `.env` (documented in `.env.example`), validated by
   `httpOnly`, `sameSite=lax` cookie, kept in memory for 12 hours. Failed logins: 5 per 15 minutes
   per client.
 - **Write tools exist only when the user allows changes.** The checkbox (or `--allow-changes`)
-  goes through `agentMode()` in `run-agent.ts` into the MCP config as `ONCADE_READ_ONLY`. The MCP
+  goes through `agentMode()` in `request-scope.ts` into the MCP config as `ONCADE_READ_ONLY`. The MCP
   server registers create / send / cancel only when that value is exactly `0`; unset or anything
   else is read-only. In read-only mode the CLI also gets `--disallowedTools` for them.
 - **Send and cancel act only on invoices the user named.** With changes allowed, prompt injection
@@ -199,7 +214,7 @@ instead of falling back to the real `spawn` or `which`, and the Oncade client in
 | `apps/mcp/src/tools.test.ts`                 |    52 | Tool surface per mode, envelope, write guard (ids, numbers, normalisation, receiver emails, `sendEmail`), env mapping, ref and email extraction (non-ASCII tokens), link-session cache |
 | `apps/server/src/app.test.ts`                |    44 | Security config, login and sessions, `/ask` modes and limits, budget 429, ledger 503, the two ports and their bind address, `/healthz` (no leaks), webhook route, dedupe, rotation     |
 | `apps/agent/src/run-agent.test.ts`           |    28 | Stream parsing, sandbox args, MCP config, runAgent with a fake CLI (mode, allowed invoices and emails), the reservation ledger, no leaked reservation, the vitest guard, run log       |
-| `apps/agent/src/runs.test.ts`                |    18 | The ledger directly: I/O failures, per-entry validation, pruning, the lock (owner token, live holder, takeover) and 8 real processes against one ledger                                |
+| `apps/agent/src/budget.test.ts`              |    18 | The ledger directly: I/O failures, per-entry validation, pruning, the lock (owner token, live holder, takeover) and 8 real processes against one ledger                                |
 | `packages/oncade-client/src/client.test.ts`  |    14 | Headers, idempotency keys (fixed vectors), retries, timeouts, no real `fetch` under vitest                                                                                             |
 | `evals/grade.test.ts`                        |    10 | The eval grader, including the status-before/after assertions                                                                                                                          |
 | `packages/oncade-client/src/webhook.test.ts` |     8 | Signature verifier, including the malformed signatures that crash Oncade's sample                                                                                                      |
@@ -230,8 +245,8 @@ named mutant), then the fix went in.
 | Method dropped from the idempotency hash                        | POST and PUT differ; fixed vectors computed outside the code (the old test computed the expected value with the function under test)                                                                                                                          |
 
 The verifier also found that the one-run-per-server test failed only by a 5 s timeout when its
-lock was removed; it now fails in under a second with `expected 200 to be 429`. And a `retryable`
-flag in the client that was always true; it is gone.
+lock was removed; it now fails in under a second with `expected 200 to be 429`. It also found a
+`retryable` flag in the client that was always true, and that flag has been removed.
 
 One more finding from this round: the first version of the runAgent test was written before
 `runAgent` accepted injected dependencies, so against the old code it launched the real `claude`
@@ -387,5 +402,32 @@ skipped on purpose.
   (at most one per 30 minutes) for a business admin to approve.
 - **Config errors come in two passes** when the port clash is not the only problem: Zod runs the
   cross-field check only after every field is valid.
-- **Evals are small and single-sample**: ten cases, one run each, against live test data. A pass is
+- **Evals are small and single-sample**: eleven cases, one run each, against live test data. A pass is
   evidence, not a guarantee.
+
+## Next improvement: a long-lived agent backend
+
+Every question starts two processes: `claude -p`, and inside it the MCP server over stdio. That
+costs 3 to 10 seconds per question, and the configuration is read again each time. For a product
+I would change four things:
+
+1. **Serve MCP over HTTP.** Run the MCP server once, next to the app, using the Streamable HTTP
+   transport from `@modelcontextprotocol/sdk` on a local port. `claude -p` then connects to it by
+   URL (`"type": "http"` in `--mcp-config`), so no Node process starts per question.
+2. **Move per-run permissions from environment variables into a session.** Today read-only mode,
+   the allowed invoice ids and emails, and the run id behind the idempotency keys reach the MCP
+   server as environment variables, because the process is new for every run. A long-lived server
+   needs a run token instead: `runAgent` registers the run's permissions with the server and gets a
+   short-lived token back, the MCP client sends it in a header, and the write guard applies the
+   permissions of the session that owns the token. The main risk is mixing up two runs'
+   permissions, so this needs tests for session isolation.
+3. **Keep the sandbox narrow.** The sandbox still needs network access, but only to the local MCP
+   port. The simple option is to bind MCP to 127.0.0.1 and require the token. The stricter one is a
+   Unix socket mounted into the sandbox.
+4. **Replace the CLI with an in-process agent loop.** Starting `claude -p` is the other half of the
+   delay. An agent loop on the Anthropic SDK (Messages API with tool use), running in the same
+   process as the server, removes both the CLI start and the need to sandbox the model process.
+   Only the tools need isolation then. It is the biggest change, and the right one for a product.
+
+Estimate: half a day for points 1 to 3 including the session-isolation tests, and one more day for
+point 4.

@@ -8,15 +8,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import {
-  appendRun,
-  BudgetExceededError,
-  BudgetLedgerError,
-  reserveBudget,
-  takeOver,
-  withLedgerLock,
-  type BudgetFiles,
-} from './runs';
+import { BudgetExceededError, BudgetLedgerError, reserveBudget, takeOver, withLedgerLock, type BudgetFiles } from './budget';
+import { appendRun } from './runs-log';
 
 const NOW = new Date('2026-11-18T12:00:00Z');
 const dirs: string[] = [];
@@ -193,7 +186,7 @@ describe('the ledger lock', () => {
     writeFileSync(
       child,
       `import { existsSync } from 'node:fs';
-import { reserveBudget, BudgetExceededError } from ${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, 'runs.ts')).href)};
+import { reserveBudget, BudgetExceededError } from ${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, 'budget.ts')).href)};
 const [runsLog, ledger, go, n, cap, now] = process.argv.slice(2);
 process.stdout.write('ready\\n');
 while (!existsSync(go)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);

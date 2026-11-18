@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentResult } from '../../agent/src/run-agent';
-import { BudgetExceededError, BudgetLedgerError } from '../../agent/src/runs';
+import { BudgetExceededError, BudgetLedgerError } from '../../agent/src/budget';
 import {
   buildUiApp,
   buildWebhookApp,

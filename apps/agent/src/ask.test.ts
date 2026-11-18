@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { askCommand } from './ask';
 import type { AgentResult } from './run-agent';
-import { BudgetExceededError, BudgetLedgerError } from './runs';
+import { BudgetExceededError, BudgetLedgerError } from './budget';
 
 const result = (over: Partial<AgentResult> = {}): AgentResult => ({
   answer: 'Done',

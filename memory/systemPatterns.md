@@ -24,15 +24,16 @@ allowedInvoices })`. Read-only registers read tools + `propose_invoice_change`; 
   never one dated in the future.
 - `apps/agent/src/run-agent.ts`: `runAgent(prompt, { allowChanges, runId, source }, deps?)`.
   Reserves `AGENT_MAX_BUDGET_USD` in the shared ledger first (`reserveBudget`, settled with the
-  real or estimated cost by `settleBudget`), then `agentMode()` decides read-only,
-  `extractInvoiceRefs()` / `extractEmails()` / `requestAsksForEmail()` give the write permissions,
-  all go into the generated MCP config's `env`; one turn of
-  `claude -p` with `--output-format stream-json`, `--max-turns`, `--max-budget-usd`, a wall-clock
-  timeout. `deps` (config, spawn, which, runsLog, now) are injected in tests.
-  `parseAgentStream` (pure) collects tool calls, the `result` event and the model. Appends a
-  `RunRecord` to `data/runs.jsonl` (`apps/agent/src/runs.ts`: reader, `spentToday`, the
-  reservation ledger `data/budget-reservations.json` with its `.lock`, `BudgetExceededError`,
-  `BudgetLedgerError`; `pnpm runs`). `ask.ts` is `pnpm ask`.
+  real or estimated cost by `settleBudget`), then `agentMode()` decides read-only and
+  `requestScope()` (both in `request-scope.ts`, built on `extractInvoiceRefs()` / `extractEmails()`
+  / `requestAsksForEmail()`) gives the write permissions; all go into the MCP config's `env`
+  (`mcp-config.ts`). One turn of `claude -p` (`cli-process.ts`, inside bwrap from `sandbox.ts`)
+  with `--output-format stream-json`, `--max-turns`, `--max-budget-usd`, a wall-clock timeout.
+  `deps` (config, spawn, which, runsLog, now) are injected in tests. `parseAgentStream` (pure,
+  `stream-parser.ts`) collects tool calls, the `result` event and the model. Appends a
+  `RunRecord` to `data/runs.jsonl` (`runs-log.ts`: append, reader, `formatRuns`, `pnpm runs`).
+  `budget.ts`: `spentToday`, the reservation ledger `data/budget-reservations.json` with its
+  `.lock`, `BudgetExceededError`, `BudgetLedgerError`. `ask.ts` is `pnpm ask`.
 - `apps/agent/prompts/system.md` + `CHANGELOG.md`: prompt and its versions (`prompt.ts` reads
   them; a test ties the newest entry's hash to the file). Prettier ignores this folder.
 - `apps/server/src/app.ts`: `buildUiApp(deps)` (login, `/ask`, `/healthz`; 404 for proxy headers,

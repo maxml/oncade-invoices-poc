@@ -88,5 +88,5 @@ returned `SCOPE_NOT_GRANTED` until a link session was approved; new API keys sta
 the sample webhook verifier throws on a malformed signature (500 instead of 401);
 `Idempotency-Key` must be a UUID, which the API reference does not say; platform webhook events
 carry no event id; "Mark as paid" in the dashboard emits no `Platform.Invoice.Paid` webhook;
-failed webhook deliveries are not retried automatically (attempt #1 stays failed, only a manual
-Resend delivers it).
+failed webhook deliveries are retried for only about two minutes (three attempts), and the retry
+policy is not documented.

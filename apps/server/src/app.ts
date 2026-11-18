@@ -15,7 +15,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import formbody from '@fastify/formbody';
 import cookie from '@fastify/cookie';
 import type { AgentOptions, AgentResult } from '../../agent/src/run-agent';
-import { BudgetExceededError, BudgetLedgerError } from '../../agent/src/runs';
+import { BudgetExceededError, BudgetLedgerError } from '../../agent/src/budget';
 import { verifyOncadeSignature } from '../../../packages/oncade-client/src/webhook';
 import type { SecurityConfig } from './env';
 import { RateLimiter } from './rate-limit';

@@ -6,8 +6,13 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parseConfig } from '../../../packages/config/src/config';
-import { agentMode, bwrapArgs, ETC_FILES, mcpConfig, parseAgentStream, runAgent, type SandboxInput } from './run-agent';
-import { appendRun, BudgetExceededError, BudgetLedgerError, formatRuns, readRuns, spentToday, type RunRecord } from './runs';
+import { BudgetExceededError, BudgetLedgerError, spentToday } from './budget';
+import { mcpConfig } from './mcp-config';
+import { agentMode } from './request-scope';
+import { runAgent } from './run-agent';
+import { appendRun, formatRuns, readRuns, type RunRecord } from './runs-log';
+import { bwrapArgs, ETC_FILES, type SandboxInput } from './sandbox';
+import { parseAgentStream } from './stream-parser';
 
 describe('parseAgentStream', () => {
   const lines = [

@@ -1,6 +1,6 @@
 /**
- * One JSON line per agent run in data/runs.jsonl, the reader behind `pnpm runs`, and the daily
- * budget: a reservation ledger next to the runs log, shared by every process through a lock file.
+ * The daily agent budget: a reservation ledger next to the runs log, shared by every process
+ * through a lock file. The spend side comes from the runs log (runs-log.ts).
  */
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -14,50 +14,9 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { z } from 'zod';
-
-export const DEFAULT_RUNS_LOG = resolve(import.meta.dirname, '../../../data/runs.jsonl');
-
-export interface RunRecord {
-  ts: string;
-  runId: string;
-  source: string;
-  mode: 'read-only' | 'allow-changes';
-  promptVersion: string;
-  promptSha256: string;
-  model: string;
-  toolsCalled: string[];
-  isError: boolean;
-  timedOut: boolean;
-  numTurns?: number;
-  durationMs?: number;
-  costUsd?: number;
-  /** True when the run reported no cost (crash, timeout, no result) and costUsd is the full reservation. */
-  costEstimated?: boolean;
-  sandboxed: boolean;
-}
-
-export function appendRun(file: string, r: RunRecord): void {
-  mkdirSync(dirname(file), { recursive: true });
-  appendFileSync(file, JSON.stringify(r) + '\n');
-}
-
-/** Last `n` runs, oldest first. Lines that are not valid records are skipped. */
-export function readRuns(file: string, n = 20): RunRecord[] {
-  if (!existsSync(file)) return [];
-  const out: RunRecord[] = [];
-  for (const l of readFileSync(file, 'utf8').split('\n')) {
-    if (!l.trim()) continue;
-    try {
-      const r = JSON.parse(l);
-      if (r && typeof r.runId === 'string' && typeof r.ts === 'string' && Array.isArray(r.toolsCalled)) out.push(r);
-    } catch {
-      // skip a torn line
-    }
-  }
-  return out.slice(-n);
-}
+import { appendRun, readRuns, type RunRecord } from './runs-log';
 
 /** Sum of `costUsd` of the runs logged on the same UTC day as `now`. */
 export function spentToday(file: string, now: Date): number {
@@ -303,22 +262,4 @@ export function settleBudget(f: BudgetFiles, reservationId: string, rec: RunReco
       readReservations(f.ledger).filter((x) => x.id !== reservationId),
     );
   });
-}
-
-export function formatRuns(runs: RunRecord[]): string {
-  const rows = runs.map((r) =>
-    [
-      r.ts.slice(0, 19).replace('T', ' '),
-      r.source,
-      r.mode,
-      r.promptVersion,
-      r.model,
-      r.isError ? (r.timedOut ? 'TIMEOUT' : 'ERROR') : 'ok',
-      `${r.durationMs ?? '?'}ms`,
-      r.costUsd === undefined ? '$?' : r.costEstimated ? `~$${r.costUsd.toFixed(4)} (estimated)` : `$${r.costUsd.toFixed(4)}`,
-      r.sandboxed ? 'bwrap' : 'no-sandbox',
-      r.toolsCalled.join(',') || '-',
-    ].join('  '),
-  );
-  return rows.join('\n') || '(no runs yet)';
 }

@@ -44,13 +44,13 @@ pnpm typecheck               # TypeScript 7 (the root `typescript` 6.0.x is only
   signature and never throws. Any change there needs a test in `webhook.test.ts`.
 - **MUST** keep the agent's tool surface to the `oncade` MCP server: no built-in tools, no user or
   project settings (`--tools ""`, `--strict-mcp-config`, `--setting-sources ""`).
-- **MUST NOT** widen the sandbox (`apps/agent/src/run-agent.ts`) without a reason written next to
+- **MUST NOT** widen the sandbox (`apps/agent/src/sandbox.ts`) without a reason written next to
   the bind that needs it. The agent sees read-only `/usr` and code, a short list of `/etc` files
   (`ETC_FILES`), a private `/tmp`, writable `data/state/` only, the network, and from `$HOME`
   only the Claude Code credentials file, and that only when `ANTHROPIC_API_KEY` is not set.
 - **MUST** keep write tools (create / send / cancel) out of read-only runs at the tool boundary:
   the MCP server does not register them unless `ONCADE_READ_ONLY` is exactly `0`, and only
-  `agentMode()` in `run-agent.ts` decides that, from the user's explicit choice. Never from model
+  `agentMode()` in `apps/agent/src/request-scope.ts` decides that, from the user's explicit choice. Never from model
   output or API data.
 - **MUST** keep the write guard (`apps/mcp/src/write-guard.ts`): send / cancel only invoices named
   in the user's request (ids and INV numbers extracted by `runAgent`) or created in the same run;
@@ -59,7 +59,7 @@ pnpm typecheck               # TypeScript 7 (the root `typescript` 6.0.x is only
 - **MUST** keep the UI and the webhook receiver on separate apps and ports; never tunnel `PORT`.
 - **MUST** read settings through `packages/config` (Zod), not `process.env`; a new variable goes
   into the schema and `.env.example`.
-- **MUST** keep the daily budget reservation (`reserveBudget` in `apps/agent/src/runs.ts`,
+- **MUST** keep the daily budget reservation (`reserveBudget` in `apps/agent/src/budget.ts`,
   `AGENT_DAILY_BUDGET_USD`) at the start of `runAgent`, before the CLI is spawned, so every entry
   point (web, CLI, eval) and every process passes through the shared, locked ledger. It fails
   closed: no writable runs log or ledger, no run.
