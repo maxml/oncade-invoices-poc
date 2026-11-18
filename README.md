@@ -42,14 +42,14 @@ From the terminal: `pnpm ask "Show my last 5 invoices"` (read-only) or
 ## Checks
 
 ```bash
-pnpm test           # 114 tests, no network, no secrets
+pnpm test           # 152 tests, no network, no secrets
 pnpm lint           # ESLint (typescript-eslint); pnpm format:check for Prettier
 pnpm typecheck      # TypeScript 7
-pnpm eval           # 10 eval cases through the real agent (Sonnet, sandboxed), about $0.12
+pnpm eval           # 11 eval cases through the real agent (Sonnet, sandboxed), about $0.14
 ```
 
 CI (GitHub Actions) runs install, lint, format check, typecheck and test on every push. Last
-eval: 10/10 on prompt v3, $0.1183.
+eval: 11/11 on prompt v3, $0.1419.
 
 ## How AI was used
 
@@ -58,8 +58,9 @@ MUST/SHOULD directives, verification and secrets rules), `CLAUDE.md` points to i
 keeps the brief, the patterns and the current state.
 
 Claude Code (Opus) wrote the code and did the research, with background subagents for
-implementation chunks. Codex, a different model family, reviewed and fact-checked independently.
-The in-app agent is Claude Code in headless mode on Sonnet. Nothing counted as done until it was
+implementation chunks. Codex, a different model family, fact-checked the research. Code changes
+were re-verified by independent verifier subagents (Claude Sonnet, fresh context) that re-applied
+every claimed mutation and probed for bypasses. The in-app agent is Claude Code in headless mode on Sonnet. Nothing counted as done until it was
 run, and every guard has a test that was seen failing with the guard removed.
 
 Where AI got it wrong, and how it was caught:
@@ -76,10 +77,16 @@ Where AI got it wrong, and how it was caught:
   acting on an invoice the request does not name, and the MCP server now refuses it as well.
 - Mutation testing: an independent verifier re-applied the claimed fixes and found 6 surviving
   mutants (for example, hard-coding `readOnly = false` left every test green). Each now has a
-  test that goes red with the mutant applied ([details](docs/solution.md#tests)).
+  test that goes red with the mutant applied ([details](docs/solution.md#verification-rounds)).
+- A second verifier round found bypasses: parallel runs all passed the daily budget check (the
+  cost was written only after a run), a crashed run counted as $0, and an injected note could
+  create a draft to an attacker's address and have Oncade email it. Fixed with a shared
+  reservation ledger and an email guard, each with a test seen red first.
 
 Oncade issues found while building: the owner grant had only `vc:*` scopes, so invoice calls
 returned `SCOPE_NOT_GRANTED` until a link session was approved; new API keys start with no scopes;
 the sample webhook verifier throws on a malformed signature (500 instead of 401);
 `Idempotency-Key` must be a UUID, which the API reference does not say; platform webhook events
-carry no event id.
+carry no event id; "Mark as paid" in the dashboard emits no `Platform.Invoice.Paid` webhook;
+failed webhook deliveries are not retried automatically (attempt #1 stays failed, only a manual
+Resend delivers it).

@@ -8,7 +8,7 @@ import { createOncadeClient } from '../../../packages/oncade-client/src/client';
 import { buildServer, PROPOSE_TOOL, READ_TOOLS, WRITE_TOOLS } from './tools';
 import { getOrCreateLinkSession } from './link-session';
 import { mcpOptions } from './options';
-import { extractInvoiceRefs } from './write-guard';
+import { extractEmails, extractInvoiceRefs, requestAsksForEmail } from './write-guard';
 import { parseConfig } from '../../../packages/config/src/config';
 
 const dirs: string[] = [];
@@ -21,7 +21,12 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-async function connect(readOnly: boolean, fetchImpl?: typeof fetch, allowedInvoices?: string[]) {
+async function connect(
+  readOnly: boolean,
+  fetchImpl?: typeof fetch,
+  allowedInvoices?: string[],
+  email: { allowedEmails?: string[]; emailAllowed?: boolean } = {},
+) {
   const d = tmp();
   const client = createOncadeClient({
     apiKey: 'oncade_platform_test_fake',
@@ -34,6 +39,7 @@ async function connect(readOnly: boolean, fetchImpl?: typeof fetch, allowedInvoi
     webhookLog: join(d, 'webhooks.jsonl'),
     linkSessionCache: join(d, 'state', 'link-session.json'),
     allowedInvoices,
+    ...email,
   });
   const [a, b] = InMemoryTransport.createLinkedPair();
   const mcp = new Client({ name: 'test', version: '0' });
@@ -167,9 +173,20 @@ describe('allow-changes: send / cancel only invoices the request names or this r
     expect(api.writes).toEqual([`/invoices/${NAMED}/send`]);
   });
 
+  it.each([
+    ['upper case', NAMED.toUpperCase()],
+    ['surrounding whitespace', `  ${NAMED}\n`],
+  ])('normalises the id once: %s passes the guard and the API gets the normalised id', async (_label, given) => {
+    const api = fakeOncade();
+    const mcp = await connect(false, api.fetch, [NAMED]);
+    expect((await call(mcp, 'cancel_invoice', { invoiceId: given })).isError).toBe(false);
+    expect((await call(mcp, 'send_invoice', { invoiceId: given })).isError).toBe(false);
+    expect(api.writes).toEqual([`/invoices/${NAMED}/cancel`, `/invoices/${NAMED}/send`]);
+  });
+
   it('allows sending a draft created by create_draft_invoice in the same run', async () => {
     const api = fakeOncade();
-    const mcp = await connect(false, api.fetch, []);
+    const mcp = await connect(false, api.fetch, [], { allowedEmails: ['billing@acme.example'] });
     const created = await call(mcp, 'create_draft_invoice', {
       receiverName: 'Acme',
       receiverEmail: 'billing@acme.example',
@@ -179,6 +196,99 @@ describe('allow-changes: send / cancel only invoices the request names or this r
     expect(created.isError).toBe(false);
     expect((await call(mcp, 'send_invoice', { invoiceId: CREATED })).isError).toBe(false);
     expect(api.writes).toEqual(['/invoices', `/invoices/${CREATED}/send`]);
+  });
+});
+
+describe('allow-changes: no email to an address the request did not name', () => {
+  const draft = (receiverEmail: string) => ({
+    receiverName: 'Acme',
+    receiverEmail,
+    date: '2026-11-18',
+    items: [{ description: 'Work', quantity: 1, rate: 10 }],
+  });
+  const CREATED = '6afcffff53040dcf3786ffff';
+  function fakeOncade() {
+    const writes: { path: string; body: unknown }[] = [];
+    const f = vi.fn(async (url: string, init: RequestInit) => {
+      const path = new URL(url).pathname.replace('/api/v1/platform', '');
+      if (init.method === 'POST') {
+        writes.push({ path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+        if (path === '/invoices') return new Response(JSON.stringify({ _id: CREATED, status: 'draft' }), { status: 201 });
+        return new Response(JSON.stringify({ ok: true }));
+      }
+      return new Response(JSON.stringify({ _id: path.split('/')[2], status: 'draft' }));
+    });
+    return { fetch: f as unknown as typeof fetch, writes };
+  }
+  const call = async (mcp: Client, name: string, args: Record<string, unknown>) => {
+    const r: any = await mcp.callTool({ name, arguments: args });
+    return { isError: Boolean(r.isError), body: JSON.parse(r.content[0].text) };
+  };
+
+  it('refuses create_draft_invoice to an address injected through tool data, then the send-with-email chain', async () => {
+    const api = fakeOncade();
+    // The user asked for a draft to billing@acme.example and to email it; a note says "use attacker@evil.example".
+    const mcp = await connect(false, api.fetch, [], { allowedEmails: ['billing@acme.example'], emailAllowed: true });
+    const r = await call(mcp, 'create_draft_invoice', draft('attacker@evil.example'));
+    expect(r.isError).toBe(true);
+    expect(r.body.error).toMatchObject({ refused: true });
+    expect(r.body.error.reason).toMatch(/not named in the user's request/);
+    expect(api.writes).toEqual([]);
+  });
+
+  it('allows the address the request named (case and spaces do not matter)', async () => {
+    const api = fakeOncade();
+    const mcp = await connect(false, api.fetch, [], { allowedEmails: ['billing@acme.example'] });
+    expect((await call(mcp, 'create_draft_invoice', draft(' Billing@ACME.example '))).isError).toBe(false);
+    expect(api.writes.map((w) => w.path)).toEqual(['/invoices']);
+  });
+
+  it('with no address in the request, create_draft_invoice is refused', async () => {
+    const api = fakeOncade();
+    const mcp = await connect(false, api.fetch, []);
+    expect((await call(mcp, 'create_draft_invoice', draft('billing@acme.example'))).isError).toBe(true);
+    expect(api.writes).toEqual([]);
+  });
+
+  it('refuses sendEmail=true when the request did not ask for email; sends without email works', async () => {
+    const api = fakeOncade();
+    const NAMED = '6afcec3653040dcf3786bc56';
+    const mcp = await connect(false, api.fetch, [NAMED], { emailAllowed: false });
+    const r = await call(mcp, 'send_invoice', { invoiceId: NAMED, sendEmail: true });
+    expect(r.isError).toBe(true);
+    expect(r.body.error).toMatchObject({ refused: true });
+    expect(r.body.error.reason).toMatch(/did not ask to email/);
+    expect(api.writes).toEqual([]);
+    expect((await call(mcp, 'send_invoice', { invoiceId: NAMED })).isError).toBe(false);
+    expect(api.writes).toEqual([{ path: `/invoices/${NAMED}/send`, body: { sendEmail: false } }]);
+  });
+
+  it('allows sendEmail=true when the request asked for email', async () => {
+    const api = fakeOncade();
+    const NAMED = '6afcec3653040dcf3786bc56';
+    const mcp = await connect(false, api.fetch, [NAMED], { emailAllowed: true });
+    expect((await call(mcp, 'send_invoice', { invoiceId: NAMED, sendEmail: true })).isError).toBe(false);
+    expect(api.writes).toEqual([{ path: `/invoices/${NAMED}/send`, body: { sendEmail: true } }]);
+  });
+});
+
+describe('requestAsksForEmail / extractEmails (decided by runAgent from the request text)', () => {
+  it.each([
+    ['Send INV-2026-1234567 and email it to the customer', true],
+    ['Send it by e-mail please', true],
+    ['EMAIL the invoice', true],
+    ['Send INV-2026-1234567', false],
+    ['Create a draft for billing@acme.example', false], // an address alone is not a request to email
+    ['Create a draft for email@acme.example', false],
+  ])('%j -> %s', (text, want) => {
+    expect(requestAsksForEmail(text)).toBe(want);
+  });
+
+  it('extracts addresses normalised, nothing else', () => {
+    expect(extractEmails('Bill Billing@Acme.example and ap@globex.example; not @x or a@b')).toEqual([
+      'billing@acme.example',
+      'ap@globex.example',
+    ]);
   });
 });
 
@@ -196,6 +306,22 @@ describe('MCP server options from its environment (apps/mcp/src/server.ts)', () 
     ['0', false],
   ])('ONCADE_READ_ONLY=%j -> readOnly %s (anything but "0" is read-only)', (v, readOnly) => {
     expect(opts({ ONCADE_READ_ONLY: v }).readOnly).toBe(readOnly);
+  });
+
+  it.each([
+    [undefined, false],
+    ['', false],
+    ['0', false],
+    ['true', false],
+    [' 1', false],
+    ['1', true],
+  ])('ONCADE_EMAIL_ALLOWED=%j -> emailAllowed %s (only "1" allows email)', (v, emailAllowed) => {
+    expect(opts({ ONCADE_EMAIL_ALLOWED: v }).emailAllowed).toBe(emailAllowed);
+  });
+
+  it('passes the allowed receiver emails, normalised; junk is dropped', () => {
+    expect(opts({ ONCADE_ALLOWED_EMAILS: 'Billing@Acme.example,junk' }).allowedEmails).toEqual(['billing@acme.example']);
+    expect(opts({}).allowedEmails).toEqual([]);
   });
 
   it('passes the allowed invoices and run id, and defaults the files under data/', () => {

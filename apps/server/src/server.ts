@@ -5,7 +5,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { loadEnv, securityConfig } from './env';
-import { buildUiApp, buildWebhookApp } from './app';
+import { buildUiApp, buildWebhookApp, listenBoth } from './app';
 import { WebhookStore } from './webhook-store';
 import { runAgent } from '../../agent/src/run-agent';
 import { createOncadeClient } from '../../../packages/oncade-client/src/client';
@@ -53,5 +53,4 @@ const webhooks = await buildWebhookApp({
 });
 if (!config.ONCADE_WEBHOOK_SECRET) console.warn('[webhooks] ONCADE_WEBHOOK_SECRET is not set: every webhook will get 401');
 
-await ui.listen({ port: config.PORT, host: '127.0.0.1' });
-await webhooks.listen({ port: config.WEBHOOK_PORT, host: '127.0.0.1' });
+await listenBoth(ui, webhooks, { ui: config.PORT, webhook: config.WEBHOOK_PORT });

@@ -40,6 +40,10 @@ export interface ToolOptions {
    * Send and cancel are refused for anything else that this run did not create. Default: none.
    */
   allowedInvoices?: string[];
+  /** Allow-changes mode: receiver addresses named in the request; create_draft_invoice uses only these. */
+  allowedEmails?: string[];
+  /** Allow-changes mode: the request asked for email, so send_invoice may use sendEmail=true. */
+  emailAllowed?: boolean;
 }
 
 const ENVELOPE_NOTE =
@@ -147,15 +151,22 @@ export function buildServer(client: OncadeClient, opts: ToolOptions): McpServer 
     return server;
   }
 
-  const guard = new WriteGuard(opts.allowedInvoices ?? [], (id) => client.getInvoice(id));
+  const guard = new WriteGuard(opts.allowedInvoices ?? [], (id) => client.getInvoice(id), {
+    allowedEmails: opts.allowedEmails,
+    emailAllowed: opts.emailAllowed,
+  });
+  const refused = (what: Record<string, unknown>, reason: string) =>
+    envelope({ refused: true, ...what, reason, ...guard.describe() }, true);
 
   server.registerTool(
     'create_draft_invoice',
     {
-      description: 'Create a DRAFT invoice (not visible to the recipient until sent). Amounts in dollars.',
+      description:
+        "Create a DRAFT invoice (not visible to the recipient until sent). Amounts in dollars. receiverEmail must be an address written in the user's request; others are refused.",
       inputSchema: {
         receiverName: z.string(),
-        receiverEmail: z.string().email(),
+        // Validated by the guard: after normalising it must equal an address from the request.
+        receiverEmail: z.string(),
         date: z.string().describe('ISO date, e.g. 2026-11-18'),
         dueDate: z.string().optional(),
         note: z.string().optional(),
@@ -164,29 +175,39 @@ export function buildServer(client: OncadeClient, opts: ToolOptions): McpServer 
           .min(1),
       },
     },
-    (a) =>
-      tool(async () => {
-        const created = await client.createDraftInvoice(a);
+    (a) => {
+      const r = guard.checkReceiver(a.receiverEmail);
+      if (!r.allowed) return Promise.resolve(refused({ receiverEmail: a.receiverEmail }, r.reason));
+      return tool(async () => {
+        const created = await client.createDraftInvoice({ ...a, receiverEmail: r.email });
         guard.recordCreated(created);
         return created;
-      }),
+      });
+    },
   );
 
-  /** Run a send/cancel only if the guard allows this invoice; otherwise an error envelope saying why. */
-  const guarded = async (invoiceId: string, action: () => Promise<unknown>) => {
+  /**
+   * Run a send/cancel only if the guard allows this invoice; otherwise an error envelope saying why.
+   * The action gets the guard's normalised id, never the raw argument.
+   */
+  const guarded = async (invoiceId: string, action: (id: string) => Promise<unknown>) => {
     const d = await guard.check(invoiceId);
-    if (!d.allowed) return envelope({ refused: true, invoiceId, reason: d.reason, ...guard.describe() }, true);
-    return tool(action);
+    if (!d.allowed) return refused({ invoiceId }, d.reason);
+    return tool(() => action(d.id));
   };
 
   server.registerTool(
     'send_invoice',
     {
       description:
-        'Move a draft invoice to sent. Email delivery is off unless sendEmail=true. Only for an invoice the user named in this request, or one created in this run; others are refused.',
+        'Move a draft invoice to sent. Email delivery is off unless sendEmail=true, which is allowed only when the user asked for email. Only for an invoice the user named in this request, or one created in this run; others are refused.',
       inputSchema: { invoiceId: z.string(), sendEmail: z.boolean().optional() },
     },
-    (a) => guarded(a.invoiceId, () => client.sendInvoice(a.invoiceId, a.sendEmail ?? false)),
+    (a) => {
+      const e = guard.checkSendEmail(a.sendEmail);
+      if (!e.allowed) return Promise.resolve(refused({ invoiceId: a.invoiceId, sendEmail: a.sendEmail }, e.reason));
+      return guarded(a.invoiceId, (id) => client.sendInvoice(id, a.sendEmail ?? false));
+    },
   );
 
   server.registerTool(
@@ -196,7 +217,7 @@ export function buildServer(client: OncadeClient, opts: ToolOptions): McpServer 
         'Cancel a draft or sent invoice. Terminal. Only for an invoice the user named in this request, or one created in this run; others are refused.',
       inputSchema: { invoiceId: z.string() },
     },
-    (a) => guarded(a.invoiceId, () => client.cancelInvoice(a.invoiceId)),
+    (a) => guarded(a.invoiceId, (id) => client.cancelInvoice(id)),
   );
 
   return server;

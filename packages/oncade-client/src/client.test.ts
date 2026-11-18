@@ -34,6 +34,10 @@ describe('createOncadeClient', () => {
     expect(() => createOncadeClient({ apiKey: 'oncade_platform_live_x', businessId: 'b' })).toThrow(/test key/);
   });
 
+  it('under vitest, refuses to fall back to the real fetch', () => {
+    expect(() => createOncadeClient({ apiKey: KEY, businessId: 'b' })).toThrow(/real fetch.*under vitest/);
+  });
+
   it('sends auth, version and business headers; no idempotency key on GET', async () => {
     const s = stubFetch([json(200, { invoices: [] })]);
     const c = createOncadeClient({ apiKey: KEY, businessId: 'biz_1', fetch: s.fetch, sleep: noSleep });

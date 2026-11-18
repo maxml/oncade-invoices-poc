@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { refuseRealInTests } from '../../config/src/test-guard';
 
 /** Minimal typed client for the Oncade Platform API (test environment). */
 export class OncadeError extends Error {
@@ -88,6 +89,7 @@ export function createOncadeClient(cfg: OncadeConfig) {
   }
   const base = cfg.baseUrl ?? DEFAULT_BASE;
   const runId = cfg.runId || randomUUID();
+  if (!cfg.fetch) refuseRealInTests('fetch');
   const doFetch = cfg.fetch ?? fetch;
   const sleep = cfg.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const timeoutMs = cfg.timeoutMs ?? 15_000;

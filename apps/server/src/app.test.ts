@@ -5,7 +5,16 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentResult } from '../../agent/src/run-agent';
 import { BudgetExceededError } from '../../agent/src/runs';
-import { buildUiApp, buildWebhookApp, isDirectLocal, isLoopbackAddress, type HealthChecks, type UiAppOptions } from './app';
+import {
+  buildUiApp,
+  buildWebhookApp,
+  isDirectLocal,
+  isLoopbackAddress,
+  listenBoth,
+  listenOptions,
+  type HealthChecks,
+  type UiAppOptions,
+} from './app';
 import { securityConfig } from './env';
 import { RateLimiter } from './rate-limit';
 import { WebhookStore } from './webhook-store';
@@ -145,7 +154,11 @@ describe('/ask', () => {
     const r = await form(app, '/ask', { q: 'list invoices' }, { cookie });
     expect(r.statusCode).toBe(429);
     expect(r.body).toContain('Daily agent budget of $2.00 reached');
-    expect((await form(app, '/ask', { q: 'again' }, { cookie })).statusCode).toBe(429);
+    // The second 429 must be the budget again, not the one-run lock left held by the first request.
+    const again = await form(app, '/ask', { q: 'again' }, { cookie });
+    expect(again.statusCode).toBe(429);
+    expect(again.body).not.toContain('Another question is being answered');
+    expect(again.body).toContain('Daily agent budget of $2.00 reached');
     expect(runAgent).toHaveBeenCalledTimes(2);
   });
 
@@ -230,6 +243,18 @@ describe('two ports: UI app vs webhook app', () => {
     expect((await webhook(hooks, tunnel)).statusCode).toBe(200);
   });
 
+  it('both apps listen on 127.0.0.1 only (the listen options the entry point uses)', async () => {
+    expect(listenOptions(3000)).toEqual({ port: 3000, host: '127.0.0.1' });
+    const { app, hooks } = await setup();
+    try {
+      await listenBoth(app, hooks, { ui: 0, webhook: 0 });
+      for (const a of [app, hooks]) expect((a.server.address() as { address: string }).address).toBe('127.0.0.1');
+    } finally {
+      await app.close();
+      await hooks.close();
+    }
+  });
+
   it('isLoopbackAddress', () => {
     expect(['127.0.0.1', '::1', '::ffff:127.0.0.1'].map(isLoopbackAddress)).toEqual([true, true, true]);
     expect(['10.0.0.1', '127.0.0.2', '', undefined].map(isLoopbackAddress)).toEqual([false, false, false, false]);
@@ -270,7 +295,7 @@ describe('GET /healthz', () => {
     expect(r.statusCode).toBe(200);
     expect(r.json()).toMatchObject({
       status: 'ok',
-      checks: { process: { ok: true }, oncade: { ok: true }, claude: { ok: true, path: '/usr/bin/claude' } },
+      checks: { process: { ok: true }, oncade: { ok: true }, claude: { ok: true } },
     });
   });
 
@@ -281,8 +306,21 @@ describe('GET /healthz', () => {
     expect(r.statusCode).toBe(503);
     expect(r.json()).toMatchObject({
       status: 'degraded',
-      checks: { oncade: { ok: false, error: 'HTTP 401' }, claude: { ok: true } },
+      checks: { oncade: { ok: false, error: 'http 401' }, claude: { ok: true } },
     });
+  });
+
+  it('leaks no paths and no raw error text: the CLI is found or not, errors are a short category', async () => {
+    const raw = 'connect ECONNREFUSED 10.1.2.3:443 while reading /home/dell/secret/.env';
+    const health: HealthChecks = {
+      oncade: async () => Promise.reject(Object.assign(new Error(raw), { status: 0 })),
+      claude: () => '/home/dell/.local/bin/claude',
+    };
+    const { app } = await setup({ health });
+    const r = await app.inject('/healthz');
+    expect(r.body).not.toMatch(/\/home|\/usr|ECONNREFUSED|10\.1\.2\.3|secret/);
+    expect(r.json().checks).toMatchObject({ oncade: { ok: false, error: 'network' }, claude: { ok: true } });
+    expect(Object.keys(r.json().checks.claude)).toEqual(['ok']);
   });
 
   it('503 fast when Oncade hangs (short timeout), and when the claude CLI is missing', async () => {
@@ -291,11 +329,11 @@ describe('GET /healthz', () => {
     const t = Date.now();
     const r = await app.inject('/healthz');
     expect(Date.now() - t).toBeLessThan(1000);
-    expect(r.json().checks.oncade).toMatchObject({ ok: false, error: 'timeout after 50 ms' });
+    expect(r.json().checks.oncade).toMatchObject({ ok: false, error: 'timeout' });
     const noCli = await setup({ health: { ...okHealth, claude: () => null } });
     const r2 = await noCli.app.inject('/healthz');
     expect(r2.statusCode).toBe(503);
-    expect(r2.json().checks.claude).toEqual({ ok: false, path: null });
+    expect(r2.json().checks.claude).toEqual({ ok: false });
   });
 });
 

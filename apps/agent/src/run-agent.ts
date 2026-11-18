@@ -12,9 +12,18 @@ import { mkdtempSync, writeFileSync, existsSync, rmSync, realpathSync, mkdirSync
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { parseConfig, type Config } from '../../../packages/config/src/config';
-import { extractInvoiceRefs } from '../../mcp/src/write-guard';
+import { refuseRealInTests } from '../../../packages/config/src/test-guard';
+import { extractEmails, extractInvoiceRefs, requestAsksForEmail } from '../../mcp/src/write-guard';
 import { promptInfo, SYSTEM_PROMPT_FILE } from './prompt';
-import { appendRun, assertDailyBudget, DEFAULT_RUNS_LOG, type RunRecord } from './runs';
+import {
+  DEFAULT_RUNS_LOG,
+  defaultLedger,
+  reserveBudget,
+  settleBudget,
+  type BudgetFiles,
+  type LockOptions,
+  type RunRecord,
+} from './runs';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const WRITE_TOOLS = ['create_draft_invoice', 'send_invoice', 'cancel_invoice'];
@@ -39,6 +48,8 @@ export interface AgentResult {
   isError: boolean;
   timedOut: boolean;
   costUsd?: number;
+  /** The CLI reported no cost (crash, timeout): costUsd is the full reservation, AGENT_MAX_BUDGET_USD. */
+  costEstimated?: boolean;
   durationMs?: number;
   numTurns?: number;
   sandboxed: boolean;
@@ -177,8 +188,14 @@ export function agentMode(allowChanges: boolean | undefined): { readOnly: boolea
   return { readOnly, mode: readOnly ? 'read-only' : 'allow-changes' };
 }
 
-/** The MCP config for one run; the mode lives here, outside anything the model controls. */
-export function mcpConfig(opts: { readOnly: boolean; runId: string; allowedInvoices?: string[] }) {
+/** The MCP config for one run; the mode and the write permissions live here, outside the model's reach. */
+export function mcpConfig(opts: {
+  readOnly: boolean;
+  runId: string;
+  allowedInvoices?: string[];
+  allowedEmails?: string[];
+  emailAllowed?: boolean;
+}) {
   return {
     mcpServers: {
       oncade: {
@@ -189,6 +206,8 @@ export function mcpConfig(opts: { readOnly: boolean; runId: string; allowedInvoi
           ONCADE_READ_ONLY: opts.readOnly ? '1' : '0',
           ONCADE_RUN_ID: opts.runId,
           ONCADE_ALLOWED_INVOICES: (opts.allowedInvoices ?? []).join(','),
+          ONCADE_ALLOWED_EMAILS: (opts.allowedEmails ?? []).join(','),
+          ONCADE_EMAIL_ALLOWED: opts.emailAllowed === true ? '1' : '0',
         },
       },
     },
@@ -201,16 +220,25 @@ export interface AgentDeps {
   spawn: typeof spawn;
   which: (bin: string) => string | null;
   runsLog: string;
+  /** The budget reservation ledger. Default: next to the runs log. */
+  ledger: string;
+  lock?: LockOptions;
   now: () => Date;
 }
 
 function resolveDeps(d: Partial<AgentDeps>): AgentDeps {
+  // A test that forgot to inject these would launch the real `claude`: refuse under vitest.
+  if (!d.spawn) refuseRealInTests('spawn');
+  if (!d.which) refuseRealInTests('which');
   const config = d.config ?? parseConfig(process.env);
+  const runsLog = d.runsLog ?? config.RUNS_LOG ?? DEFAULT_RUNS_LOG;
   return {
     config,
     spawn: d.spawn ?? spawn,
     which: d.which ?? which,
-    runsLog: d.runsLog ?? config.RUNS_LOG ?? DEFAULT_RUNS_LOG,
+    runsLog,
+    ledger: d.ledger ?? defaultLedger(runsLog),
+    lock: d.lock,
     now: d.now ?? (() => new Date()),
   };
 }
@@ -222,74 +250,93 @@ export async function runAgent(
 ): Promise<AgentResult> {
   const deps = resolveDeps(overrides);
   const cfg = deps.config;
-  // Daily spend cap, checked before anything starts: every entry point (web, CLI, eval) runs here.
-  assertDailyBudget(deps.runsLog, cfg.AGENT_DAILY_BUDGET_USD, deps.now());
   const claudeBin = deps.which('claude');
   if (!claudeBin) throw new Error('Claude Code CLI not found: install it and log in, or set ANTHROPIC_API_KEY');
+  const sandboxMode = cfg.AGENT_SANDBOX;
+  const bwrap = deps.which('bwrap');
+  const sandboxed = sandboxMode !== 'off' && !!bwrap;
+  if (sandboxMode === 'on' && !bwrap) throw new Error('AGENT_SANDBOX=on but bwrap is not installed');
+
+  // Daily spend cap, before anything starts: every entry point (web, CLI, eval) runs here. The run
+  // reserves its maximum cost in the shared ledger; settle() below replaces it with the real cost.
+  const budget: BudgetFiles = { runsLog: deps.runsLog, ledger: deps.ledger, lock: deps.lock };
+  const reservationId = randomUUID();
+  const reservationUsd = cfg.AGENT_MAX_BUDGET_USD;
+  reserveBudget(budget, { id: reservationId, amountUsd: reservationUsd, capUsd: cfg.AGENT_DAILY_BUDGET_USD, now: deps.now() });
+  let spawned = false;
+  /** The real cost when the CLI reported one; otherwise, once the CLI ran, the full reservation. */
+  const costOf = (reported: unknown): Pick<AgentResult, 'costUsd' | 'costEstimated'> =>
+    typeof reported === 'number' && Number.isFinite(reported)
+      ? { costUsd: reported }
+      : spawned
+        ? { costUsd: reservationUsd, costEstimated: true }
+        : {};
+
   const { readOnly, mode: runMode } = agentMode(opts.allowChanges);
   const runId = opts.runId ?? randomUUID();
   const prompt_ = promptInfo();
   const requestedModel = cfg.AGENT_MODEL;
-  // Only invoices the user's own words name may be sent or cancelled (apps/mcp/src/write-guard.ts).
+  // Only invoices the user's own words name may be sent or cancelled, drafts go only to addresses
+  // the request contains, and email only when it asks for email (apps/mcp/src/write-guard.ts).
   const allowedInvoices = readOnly ? [] : extractInvoiceRefs(prompt);
+  const allowedEmails = readOnly ? [] : extractEmails(prompt);
+  const emailAllowed = !readOnly && requestAsksForEmail(prompt);
 
-  mkdirSync(join(ROOT, 'data', 'state'), { recursive: true });
-  const workDir = mkdtempSync(join(tmpdir(), 'oncade-agent-'));
-  const mcpConfigFile = join(workDir, 'mcp.json');
-  writeFileSync(mcpConfigFile, JSON.stringify(mcpConfig({ readOnly, runId, allowedInvoices })));
-
-  // prettier-ignore
-  const claudeArgs = [
-    '-p', prompt,
-    '--model', requestedModel,
-    '--system-prompt-file', SYSTEM_PROMPT_FILE,
-    '--tools', '',
-    '--mcp-config', mcpConfigFile, '--strict-mcp-config',
-    '--allowedTools', 'mcp__oncade',
-    // Defense in depth: in read-only mode the server does not register these anyway.
-    ...(readOnly ? ['--disallowedTools', ...WRITE_TOOLS.map((t) => `mcp__oncade__${t}`)] : []),
-    '--setting-sources', '',
-    '--no-session-persistence',
-    '--max-turns', String(cfg.AGENT_MAX_TURNS),
-    '--max-budget-usd', String(cfg.AGENT_MAX_BUDGET_USD),
-    '--output-format', 'stream-json', '--verbose',
-  ];
-
-  const mode = cfg.AGENT_SANDBOX;
-  const bwrap = deps.which('bwrap');
-  const sandboxed = mode !== 'off' && !!bwrap;
-  if (mode === 'on' && !bwrap) throw new Error('AGENT_SANDBOX=on but bwrap is not installed');
-  if (!sandboxed) console.warn('[agent] running WITHOUT bwrap sandbox');
-
-  const env = agentEnv(cfg);
-  const [cmd, args] = sandboxed
-    ? [
-        bwrap!,
-        [
-          ...bwrapArgs({
-            claudeBin,
-            claudeReal: realpathSync(claudeBin),
-            nodeRoot: resolve(dirname(process.execPath), '..'),
-            workDir,
-            home: homedir(),
-            root: ROOT,
-            resolvConf: realpathSync('/etc/resolv.conf'),
-            env,
-            exists: existsSync,
-          }),
-          '--clearenv',
-          ...Object.entries(env).flatMap(([k, v]) => ['--setenv', k, v]),
-          claudeBin,
-          ...claudeArgs,
-        ],
-      ]
-    : [claudeBin, claudeArgs];
-
+  let workDir: string | undefined;
   const started = Date.now();
   let timedOut = false;
   try {
+    mkdirSync(join(ROOT, 'data', 'state'), { recursive: true });
+    workDir = mkdtempSync(join(tmpdir(), 'oncade-agent-'));
+    const mcpConfigFile = join(workDir, 'mcp.json');
+    writeFileSync(mcpConfigFile, JSON.stringify(mcpConfig({ readOnly, runId, allowedInvoices, allowedEmails, emailAllowed })));
+
+    // prettier-ignore
+    const claudeArgs = [
+      '-p', prompt,
+      '--model', requestedModel,
+      '--system-prompt-file', SYSTEM_PROMPT_FILE,
+      '--tools', '',
+      '--mcp-config', mcpConfigFile, '--strict-mcp-config',
+      '--allowedTools', 'mcp__oncade',
+      // Defense in depth: in read-only mode the server does not register these anyway.
+      ...(readOnly ? ['--disallowedTools', ...WRITE_TOOLS.map((t) => `mcp__oncade__${t}`)] : []),
+      '--setting-sources', '',
+      '--no-session-persistence',
+      '--max-turns', String(cfg.AGENT_MAX_TURNS),
+      '--max-budget-usd', String(cfg.AGENT_MAX_BUDGET_USD),
+      '--output-format', 'stream-json', '--verbose',
+    ];
+
+    if (!sandboxed) console.warn('[agent] running WITHOUT bwrap sandbox');
+
+    const env = agentEnv(cfg);
+    const [cmd, args] = sandboxed
+      ? [
+          bwrap!,
+          [
+            ...bwrapArgs({
+              claudeBin,
+              claudeReal: realpathSync(claudeBin),
+              nodeRoot: resolve(dirname(process.execPath), '..'),
+              workDir,
+              home: homedir(),
+              root: ROOT,
+              resolvConf: realpathSync('/etc/resolv.conf'),
+              env,
+              exists: existsSync,
+            }),
+            '--clearenv',
+            ...Object.entries(env).flatMap(([k, v]) => ['--setenv', k, v]),
+            claudeBin,
+            ...claudeArgs,
+          ],
+        ]
+      : [claudeBin, claudeArgs];
+
     let stderr = '';
     const lines = await new Promise<string[]>((ok, fail) => {
+      spawned = true;
       const p = deps.spawn(cmd, args, { env: sandboxed ? {} : env, cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
       let err = '';
@@ -297,6 +344,10 @@ export async function runAgent(
         timedOut = true;
         p.kill('SIGKILL');
       }, cfg.AGENT_TIMEOUT_MS);
+      p.on('error', (e) => {
+        clearTimeout(timer);
+        fail(e);
+      });
       p.stdout.on('data', (d) => (out += d));
       p.stderr.on('data', (d) => (err += d));
       p.on('close', (code) => {
@@ -320,7 +371,7 @@ export async function runAgent(
       toolCalls: parsed.toolCalls,
       isError: Boolean(final?.is_error ?? !final) || timedOut,
       timedOut,
-      costUsd: final?.total_cost_usd as number | undefined,
+      ...costOf(final?.total_cost_usd),
       durationMs: (final?.duration_ms as number | undefined) ?? Date.now() - started,
       numTurns: final?.num_turns as number | undefined,
       sandboxed,
@@ -329,16 +380,19 @@ export async function runAgent(
       model: parsed.model ?? requestedModel,
       promptVersion: prompt_.version,
     };
-    record(deps, result, prompt_.sha256, opts.source ?? 'cli');
+    settle(budget, reservationId, deps, result, prompt_.sha256, opts.source ?? 'cli');
     return result;
   } catch (e) {
-    record(
+    settle(
+      budget,
+      reservationId,
       deps,
       {
         answer: '',
         toolCalls: [],
         isError: true,
         timedOut,
+        ...costOf(undefined),
         sandboxed,
         runId,
         mode: runMode,
@@ -351,11 +405,19 @@ export async function runAgent(
     );
     throw e;
   } finally {
-    rmSync(workDir, { recursive: true, force: true });
+    if (workDir) rmSync(workDir, { recursive: true, force: true });
   }
 }
 
-function record(deps: AgentDeps, r: AgentResult, promptSha256: string, source: string) {
+/** Log the run and release its reservation. On failure the reservation stays, so the cost still counts. */
+function settle(
+  budget: BudgetFiles,
+  reservationId: string,
+  deps: AgentDeps,
+  r: AgentResult,
+  promptSha256: string,
+  source: string,
+) {
   const rec: RunRecord = {
     ts: deps.now().toISOString(),
     runId: r.runId,
@@ -370,11 +432,12 @@ function record(deps: AgentDeps, r: AgentResult, promptSha256: string, source: s
     numTurns: r.numTurns,
     durationMs: r.durationMs,
     costUsd: r.costUsd,
+    ...(r.costEstimated ? { costEstimated: true } : {}),
     sandboxed: r.sandboxed,
   };
   try {
-    appendRun(deps.runsLog, rec);
+    settleBudget(budget, reservationId, rec);
   } catch (e) {
-    console.warn(`[agent] could not write the run log: ${String(e)}`);
+    console.warn(`[agent] could not log the run; its budget reservation stays counted: ${String(e)}`);
   }
 }

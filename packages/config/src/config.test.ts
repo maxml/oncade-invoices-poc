@@ -36,12 +36,22 @@ describe('parseConfig', () => {
       AGENT_MAX_TURNS: 'many',
       PORT: '70000',
     });
-    expect(p.find((x) => x.startsWith('ONCADE_API_KEY:'))).toMatch(/TEST platform key/);
-    expect(p.find((x) => x.startsWith('ONCADE_BUSINESS_ID:'))).toMatch(/required/);
-    expect(p.find((x) => x.startsWith('AGENT_SANDBOX:'))).toMatch(/auto/);
+    expect(p).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^ONCADE_API_KEY: .*TEST platform key/),
+        expect.stringMatching(/^ONCADE_BUSINESS_ID: .*required/),
+        expect.stringMatching(/^AGENT_SANDBOX: .*auto/),
+      ]),
+    );
     expect(p.some((x) => x.startsWith('AGENT_MAX_TURNS:'))).toBe(true);
     expect(p.some((x) => x.startsWith('PORT:'))).toBe(true);
     expect(() => parseConfig({})).toThrow(/Invalid configuration[\s\S]*- ONCADE_API_KEY: is required/);
+  });
+
+  it('rejects a live key with exactly one problem, naming ONCADE_API_KEY and the test-key rule', () => {
+    expect(problems({ ...base, ONCADE_API_KEY: 'oncade_platform_live_x' })).toEqual([
+      expect.stringMatching(/^ONCADE_API_KEY: must be an Oncade TEST platform key/),
+    ]);
   });
 
   it('refuses the same port for the UI and the webhook receiver', () => {

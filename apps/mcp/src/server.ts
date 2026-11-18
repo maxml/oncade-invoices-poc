@@ -6,6 +6,9 @@
  * - ONCADE_READ_ONLY: write tools are registered only when it is exactly "0"; unset = read-only.
  * - ONCADE_ALLOWED_INVOICES: invoice ids / numbers named in the user's request; send and cancel
  *   are refused for any other invoice that this run did not create.
+ * - ONCADE_ALLOWED_EMAILS: receiver addresses named in the request; create_draft_invoice uses
+ *   no other address. ONCADE_EMAIL_ALLOWED: exactly "1" when the request asked for email;
+ *   otherwise send_invoice refuses sendEmail=true.
  * - ONCADE_RUN_ID scopes the deterministic Idempotency-Key of writes to one agent run.
  */
 import { resolve } from 'node:path';

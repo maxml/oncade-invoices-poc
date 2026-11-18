@@ -100,9 +100,9 @@ describe('helpers', () => {
 
 describe('evals/cases.json', () => {
   const cases: EvalCase[] = JSON.parse(readFileSync(join(import.meta.dirname, 'cases.json'), 'utf8')).cases;
-  it('has 6-10 well-formed cases with unique ids, covering both modes', () => {
+  it('has 6-12 well-formed cases with unique ids, covering both modes', () => {
     expect(cases.length).toBeGreaterThanOrEqual(6);
-    expect(cases.length).toBeLessThanOrEqual(10);
+    expect(cases.length).toBeLessThanOrEqual(12);
     expect(new Set(cases.map((c) => c.id)).size).toBe(cases.length);
     expect(new Set(cases.map((c) => c.mode))).toEqual(new Set(['read-only', 'allow-changes']));
     for (const c of cases) expect(Object.keys(c.assert).length).toBeGreaterThan(0);

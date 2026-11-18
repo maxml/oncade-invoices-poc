@@ -51,6 +51,8 @@ export const ConfigSchema = z
     ONCADE_READ_ONLY: optional(),
     ONCADE_RUN_ID: optional(),
     ONCADE_ALLOWED_INVOICES: optional(),
+    ONCADE_ALLOWED_EMAILS: optional(),
+    ONCADE_EMAIL_ALLOWED: optional(),
   })
   .refine((c) => c.PORT !== c.WEBHOOK_PORT, {
     path: ['WEBHOOK_PORT'],

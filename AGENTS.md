@@ -22,7 +22,7 @@ pnpm dev                     # UI on 127.0.0.1:$PORT (3000), webhook receiver on
 pnpm ask "<question>"        # one agent turn from the terminal (read-only)
 pnpm ask --allow-changes "<question>"   # with create/send/cancel tools
 pnpm runs                    # last agent runs from data/runs.jsonl
-pnpm eval                    # 10 eval cases through the real agent (~$0.12), see docs/solution.md PromptOps
+pnpm eval                    # 11 eval cases through the real agent (~$0.14), see docs/solution.md PromptOps
 pnpm mcp                     # the Oncade MCP server on stdio (read-only unless ONCADE_READ_ONLY=0)
 pnpm tunnel                  # ngrok to the WEBHOOK port only (3001), to receive real webhooks
 pnpm test                    # vitest, no network, no secrets
@@ -53,14 +53,20 @@ pnpm typecheck               # TypeScript 7 (the root `typescript` 6.0.x is only
   `agentMode()` in `run-agent.ts` decides that, from the user's explicit choice. Never from model
   output or API data.
 - **MUST** keep the write guard (`apps/mcp/src/write-guard.ts`): send / cancel only invoices named
-  in the user's request (ids and INV numbers extracted by `runAgent`) or created in the same run.
+  in the user's request (ids and INV numbers extracted by `runAgent`) or created in the same run;
+  the id is normalised once and only the normalised id reaches the action; drafts only to an
+  address in the request; `sendEmail: true` only when the request asks for email.
 - **MUST** keep the UI and the webhook receiver on separate apps and ports; never tunnel `PORT`.
 - **MUST** read settings through `packages/config` (Zod), not `process.env`; a new variable goes
   into the schema and `.env.example`.
-- **MUST** keep the daily budget check (`AGENT_DAILY_BUDGET_USD`) at the start of `runAgent`, so
-  every entry point (web, CLI, eval) passes through it.
+- **MUST** keep the daily budget reservation (`reserveBudget` in `apps/agent/src/runs.ts`,
+  `AGENT_DAILY_BUDGET_USD`) at the start of `runAgent`, before the CLI is spawned, so every entry
+  point (web, CLI, eval) and every process passes through the shared, locked ledger. It fails
+  closed: no writable runs log or ledger, no run.
 - **MUST** keep tests free of network and secrets: inject fetch, the clock, the CLI (`runAgent`'s
-  third argument) and the run log. A test that can reach the real `claude` or Oncade is a bug.
+  third argument) and the run log. A test that can reach the real `claude` or Oncade is a bug;
+  under vitest `runAgent` and the Oncade client throw instead of using the real spawn / which /
+  fetch.
 - **MUST** keep every tool result inside the `envelope()` in `apps/mcp/src/tools.ts`.
 - **MUST** make the agent state only facts that came from a tool result in that run
   (`apps/agent/prompts/system.md`). Sending or cancelling an invoice happens only when the user asks.

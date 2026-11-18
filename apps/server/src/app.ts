@@ -15,7 +15,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import formbody from '@fastify/formbody';
 import cookie from '@fastify/cookie';
 import type { AgentOptions, AgentResult } from '../../agent/src/run-agent';
-import { BudgetExceededError } from '../../agent/src/runs';
+import { BudgetExceededError, BudgetLedgerError } from '../../agent/src/runs';
 import { verifyOncadeSignature } from '../../../packages/oncade-client/src/webhook';
 import type { SecurityConfig } from './env';
 import { RateLimiter } from './rate-limit';
@@ -69,6 +69,19 @@ export function isLoopbackAddress(addr: string | undefined): boolean {
   return addr !== undefined && LOOPBACK_ADDRESSES.has(addr);
 }
 
+/** Both listeners bind to loopback only; the tunnel reaches the webhook port through ngrok on this host. */
+export const LISTEN_HOST = '127.0.0.1';
+
+export function listenOptions(port: number): { port: number; host: string } {
+  return { port, host: LISTEN_HOST };
+}
+
+/** What server.ts does: the UI on `ports.ui`, the webhook receiver on `ports.webhook`, both on loopback. */
+export async function listenBoth(ui: FastifyInstance, webhooks: FastifyInstance, ports: { ui: number; webhook: number }) {
+  await ui.listen(listenOptions(ports.ui));
+  await webhooks.listen(listenOptions(ports.webhook));
+}
+
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 const notFound = { message: 'Not Found', statusCode: 404 };
@@ -91,29 +104,33 @@ export async function buildUiApp(o: UiAppOptions): Promise<FastifyInstance> {
     return reply.code(404).send(notFound);
   });
 
-  app.get('/healthz', async (_req, reply) => {
+  // No paths and no raw error text in the body: the CLI is found or not, an Oncade failure is a
+  // short category (timeout / http <status> / network). Details go to the server log.
+  app.get('/healthz', async (req, reply) => {
     const timeoutMs = o.health.timeoutMs ?? 3_000;
     const started = Date.now();
+    const TIMEOUT = Symbol('timeout');
     let oncade: { ok: boolean; ms: number; error?: string };
     try {
-      await Promise.race([
-        o.health.oncade(),
-        new Promise((_ok, fail) => setTimeout(() => fail(new Error(`timeout after ${timeoutMs} ms`)), timeoutMs).unref()),
-      ]);
+      await Promise.race([o.health.oncade(), new Promise((_ok, fail) => setTimeout(() => fail(TIMEOUT), timeoutMs).unref())]);
       oncade = { ok: true, ms: Date.now() - started };
     } catch (e) {
-      const status = (e as { status?: unknown }).status;
-      oncade = {
-        ok: false,
-        ms: Date.now() - started,
-        error: typeof status === 'number' && status > 0 ? `HTTP ${status}` : String((e as Error).message ?? e).slice(0, 200),
-      };
+      const status = (e as { status?: unknown } | null)?.status;
+      const name = (e as { name?: unknown } | null)?.name;
+      const body = JSON.stringify((e as { body?: unknown } | null)?.body ?? '');
+      const error =
+        e === TIMEOUT || name === 'TimeoutError' || /timeout/i.test(body)
+          ? 'timeout'
+          : typeof status === 'number' && status > 0
+            ? `http ${status}`
+            : 'network';
+      if (e !== TIMEOUT) req.log.warn({ err: e }, `healthz: Oncade check failed (${error})`);
+      oncade = { ok: false, ms: Date.now() - started, error };
     }
-    const claudePath = o.health.claude();
     const checks = {
       process: { ok: true, uptimeS: Math.round(process.uptime()) },
       oncade,
-      claude: { ok: claudePath !== null, path: claudePath },
+      claude: { ok: o.health.claude() !== null },
     };
     const ok = checks.oncade.ok && checks.claude.ok;
     return reply.code(ok ? 200 : 503).send({ status: ok ? 'ok' : 'degraded', checks });
@@ -203,13 +220,20 @@ button{font:inherit;padding:8px 16px;margin-top:8px}pre{white-space:pre-wrap;bac
       return reply.type('text/html').send(
         page(`${askForm(q, allowChanges)}<h2>Answer</h2><pre>${esc(r.answer)}</pre>
 <p class="muted">Tools used:</p><pre class="muted">${esc(tools)}</pre>
-<p class="muted">${r.mode} · sandboxed: ${r.sandboxed} · ${r.durationMs ?? '?'} ms · $${r.costUsd?.toFixed(4) ?? '?'} · prompt ${esc(r.promptVersion)}</p>`),
+<p class="muted">${r.mode} · sandboxed: ${r.sandboxed} · ${r.durationMs ?? '?'} ms · ${r.costEstimated ? '~' : ''}$${r.costUsd?.toFixed(4) ?? '?'}${r.costEstimated ? ' (estimated)' : ''} · prompt ${esc(r.promptVersion)}</p>`),
       );
     } catch (e) {
       if (e instanceof BudgetExceededError) {
-        req.log.warn({ spentUsd: e.spentUsd, capUsd: e.capUsd }, 'daily agent budget reached');
+        req.log.warn({ spentUsd: e.spentUsd, reservedUsd: e.reservedUsd, capUsd: e.capUsd }, 'daily agent budget reached');
         return reply
           .code(429)
+          .type('text/html')
+          .send(page(`${askForm(q, allowChanges)}<p class="warn">${esc(e.message)}</p>`));
+      }
+      if (e instanceof BudgetLedgerError) {
+        req.log.error(e, 'budget ledger unavailable: run refused');
+        return reply
+          .code(503)
           .type('text/html')
           .send(page(`${askForm(q, allowChanges)}<p class="warn">${esc(e.message)}</p>`));
       }
