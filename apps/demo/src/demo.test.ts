@@ -31,11 +31,12 @@ function fakeOncade() {
   return { fetch: fakeFetch, calls };
 }
 
-let dir = '';
-afterEach(() => dir && rmSync(dir, { recursive: true, force: true }));
+const dirs: string[] = [];
+afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
 
 function setup(over: Partial<DemoDeps> = {}) {
-  dir = mkdtempSync(join(tmpdir(), 'demo-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'demo-test-'));
+  dirs.push(dir);
   const lines: string[] = [];
   const oncade = fakeOncade();
   const deps: DemoDeps = {
