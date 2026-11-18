@@ -42,7 +42,7 @@ From the terminal: `pnpm ask "Show my last 5 invoices"` (read-only) or
 ## Checks
 
 ```bash
-pnpm test           # 152 tests, no network, no secrets
+pnpm test           # 186 tests, no network, no secrets
 pnpm lint           # ESLint (typescript-eslint); pnpm format:check for Prettier
 pnpm typecheck      # TypeScript 7
 pnpm eval           # 11 eval cases through the real agent (Sonnet, sandboxed), about $0.14

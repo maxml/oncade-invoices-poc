@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { askCommand } from './ask';
 import type { AgentResult } from './run-agent';
-import { BudgetExceededError } from './runs';
+import { BudgetExceededError, BudgetLedgerError } from './runs';
 
 const result = (over: Partial<AgentResult> = {}): AgentResult => ({
   answer: 'Done',
@@ -40,6 +40,24 @@ describe('pnpm ask', () => {
     expect(await askCommand(['list invoices'], { runAgent, ...o.write })).toBe(3);
     expect(o.err.join('')).toMatch(/Daily agent budget of \$2\.00 reached/);
     expect(o.out).toEqual([]);
+  });
+
+  it('budget ledger unavailable: exits 3 with the reason, not a stack trace', async () => {
+    const runAgent = vi.fn(async () => {
+      throw new BudgetLedgerError('Budget ledger is locked by another process (/x.lock); no run started. Try again.');
+    });
+    const o = io();
+    expect(await askCommand(['list invoices'], { runAgent, ...o.write })).toBe(3);
+    expect(o.err.join('')).toBe('Budget ledger is locked by another process (/x.lock); no run started. Try again.\n');
+    expect(o.out).toEqual([]);
+  });
+
+  it('other errors are not swallowed as a budget refusal', async () => {
+    const runAgent = vi.fn(async () => {
+      throw new Error('boom');
+    });
+    const o = io();
+    await expect(askCommand(['list invoices'], { runAgent, ...o.write })).rejects.toThrow('boom');
   });
 
   it('without a question prints usage and exits 2', async () => {

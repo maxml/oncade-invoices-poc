@@ -1,10 +1,11 @@
 /**
  * Verified webhook events, appended to a JSONL file with replay/duplicate protection.
  *
- * - Dedupe key: the event's `id` when it has one, else sha256 of the raw body. Oncade's platform
- *   events carry no id (event, data, timestamp), and a retry re-sends the same signed body, so the
- *   body hash is what identifies a delivery. The key is stored on each line, and the set of seen
- *   keys is rebuilt from the files on start, so a restart does not forget them.
+ * - Dedupe key (`dedupeKey`): the event's `id` when it has one, else a hash of the canonical JSON
+ *   of event name + timestamp + data. Oncade's platform events carry no id, and a "Resend"
+ *   re-delivers the same event, timestamp and data. The key is stored on each line, and on start
+ *   the seen set is rebuilt from the files, recomputing the key from each line's content as well,
+ *   so a restart does not forget them and lines written by older code still count.
  * - Size cap: when the log would exceed `maxBytes` it is rotated to `<file>.1` (one generation
  *   kept). Keys from both files are remembered, so dedupe survives one rotation.
  */
@@ -19,9 +20,34 @@ export type IngestResult =
 
 export const DEFAULT_MAX_LOG_BYTES = 1_000_000;
 
-export function dedupeKey(raw: Buffer, event: Record<string, unknown>): string {
+/** JSON with object keys sorted at every level: the same value always gives the same text. */
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  if (v && typeof v === 'object')
+    return `{${Object.keys(v)
+      .sort()
+      .filter((k) => (v as Record<string, unknown>)[k] !== undefined)
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`)
+      .join(',')}}`;
+  return JSON.stringify(v) ?? 'null';
+}
+
+/** Fields the store adds to a stored line; never part of the event's identity. */
+const STORE_FIELDS = ['receivedAt', 'dedupeKey'];
+
+/**
+ * The event's identity, from its content, never from the raw bytes: `id` when it has one; else
+ * event name + timestamp + data (what an Oncade "Resend" repeats); else the whole event without
+ * the store's own fields. Canonical JSON, so whitespace and key order do not matter, and the same
+ * function reads a stored line back (`loadKeys`), so lines from older code get the same key.
+ */
+export function dedupeKey(event: Record<string, unknown>): string {
   if (typeof event.id === 'string' && event.id) return `id:${event.id}`;
-  return `sha256:${createHash('sha256').update(raw).digest('hex')}`;
+  const identity =
+    typeof event.event === 'string' && typeof event.timestamp === 'string'
+      ? { event: event.event, timestamp: event.timestamp, data: event.data }
+      : Object.fromEntries(Object.entries(event).filter(([k]) => !STORE_FIELDS.includes(k)));
+  return `sha256:${createHash('sha256').update(canonicalJson(identity)).digest('hex')}`;
 }
 
 export class WebhookStore {
@@ -46,7 +72,7 @@ export class WebhookStore {
     }
     if (!event || typeof event !== 'object' || Array.isArray(event)) return { status: 'invalid_json' };
     const ev = event as Record<string, unknown>;
-    const key = dedupeKey(raw, ev);
+    const key = dedupeKey(ev);
     if (this.seen.has(key)) return { status: 'duplicate', key };
     const line = JSON.stringify({ ...ev, receivedAt: this.now().toISOString(), dedupeKey: key }) + '\n';
     mkdirSync(dirname(this.file), { recursive: true });
@@ -67,8 +93,12 @@ export class WebhookStore {
     for (const l of readFileSync(path, 'utf8').split('\n')) {
       if (!l.trim()) continue;
       try {
-        const k = JSON.parse(l).dedupeKey;
-        if (typeof k === 'string') this.seen.add(k);
+        const stored = JSON.parse(l);
+        if (!stored || typeof stored !== 'object' || Array.isArray(stored)) continue;
+        // The key stored on the line (any scheme), and the key computed now from its content: a
+        // line written by older code (no dedupeKey, or a raw-body hash) still dedupes.
+        if (typeof stored.dedupeKey === 'string') this.seen.add(stored.dedupeKey);
+        this.seen.add(dedupeKey(stored));
       } catch {
         // a torn line is skipped
       }

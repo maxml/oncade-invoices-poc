@@ -78,7 +78,7 @@ remote address is loopback.
 | Agent runtime | Claude Code CLI in headless mode (`claude -p`)         | No agent loop to write; works with `ANTHROPIC_API_KEY` or a Claude Code login; the model is one setting                                                                         |
 | Isolation     | bubblewrap (`bwrap`)                                   | The agent process sees a read-only system and repo, a private `/tmp`, and nothing of `$HOME` beyond what it needs                                                               |
 | Web           | Fastify 5, signed session cookie, server-rendered HTML | One screen and one webhook route; no frontend build                                                                                                                             |
-| Webhooks      | HMAC-SHA256 over the raw body, constant-time compare   | The verifier never throws (Oncade's sample does on a short signature); dedupe by event id or body hash                                                                          |
+| Webhooks      | HMAC-SHA256 over the raw body, constant-time compare   | The verifier never throws (Oncade's sample does on a short signature); dedupe by event id or content hash                                                                       |
 | Tests         | Vitest, `fastify.inject`, injected fetch/clock/CLI     | No network and no secrets in tests, so CI needs none                                                                                                                            |
 | Lint, format  | ESLint 10 (flat config, typescript-eslint), Prettier   | `pnpm lint`, `pnpm format:check`, both in CI                                                                                                                                    |
 | Typecheck     | TypeScript 7 (`pnpm typecheck`)                        | typescript-eslint needs TypeScript's JS API, which TS 7 does not ship, so the root `typescript` is 6.0.x for the linter and `typecheck` runs TS 7 from the `typescript-7` alias |
@@ -152,9 +152,10 @@ Everything comes from `.env` (documented in `.env.example`), validated by
   Oncade. 15 s timeout per attempt; 429, 5xx, network errors and timeouts retried up to 3 attempts
   with backoff (`Retry-After` honoured).
 - **Webhooks.** Bad signature: 401, nothing stored. Signed body that is not a JSON object: 400.
-  Duplicate (same event id, or same raw body hash; platform events carry no id): 200
+  Duplicate (same event id, or, since platform events carry no id, the same event name, timestamp
+  and data as canonical JSON, so whitespace and key order do not matter): 200
   `{"duplicate": true}`, not stored. The log rotates at 1 MB to `webhooks.jsonl.1`; dedupe keys of
-  both files are kept, also right after a rotation.
+  both files are kept, also right after a rotation, and recomputed from each stored line's content.
 - **Access requests.** `request_invoice_access` reuses the link session it created in the last 30
   minutes (and not past Oncade's `expiresAt`, and not dated in the future), cached in
   `data/state/link-session.json`.
@@ -189,21 +190,22 @@ the OAuth token in place.
 
 ## Tests
 
-`pnpm test`: 152 tests in 9 files, no network and no secrets. Under vitest, `runAgent` throws
+`pnpm test`: 186 tests in 10 files, no network and no secrets. Under vitest, `runAgent` throws
 instead of falling back to the real `spawn` or `which`, and the Oncade client instead of the real
 `fetch` (a test that forgets to inject them fails; it cannot reach the CLI or the API).
 
-| File                                         | Tests | What it covers                                                                                                                                                       |
-| -------------------------------------------- | ----: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/mcp/src/tools.test.ts`                 |    44 | Tool surface per mode, envelope, write guard (ids, numbers, normalisation, receiver emails, `sendEmail`), env mapping, ref and email extraction, link-session cache  |
-| `apps/server/src/app.test.ts`                |    39 | Security config, login and sessions, `/ask` modes and limits, budget 429, the two ports and their bind address, `/healthz` (no leaks), webhook route, store rotation |
-| `apps/agent/src/run-agent.test.ts`           |    27 | Stream parsing, sandbox args, MCP config, runAgent with a fake CLI (mode, allowed invoices and emails), the reservation ledger, the vitest guard, run log            |
-| `packages/oncade-client/src/client.test.ts`  |    14 | Headers, idempotency keys (fixed vectors), retries, timeouts, no real `fetch` under vitest                                                                           |
-| `evals/grade.test.ts`                        |    10 | The eval grader, including the status-before/after assertions                                                                                                        |
-| `packages/oncade-client/src/webhook.test.ts` |     8 | Signature verifier, including the malformed signatures that crash Oncade's sample                                                                                    |
-| `packages/config/src/config.test.ts`         |     5 | Defaults, readable errors naming the variable, live key refused, port clash, budget bounds                                                                           |
-| `apps/agent/src/ask.test.ts`                 |     3 | `pnpm ask`: flags, budget message and exit code, usage                                                                                                               |
-| `apps/agent/src/prompt.test.ts`              |     2 | The prompt's changelog hash matches the file                                                                                                                         |
+| File                                         | Tests | What it covers                                                                                                                                                                         |
+| -------------------------------------------- | ----: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/mcp/src/tools.test.ts`                 |    52 | Tool surface per mode, envelope, write guard (ids, numbers, normalisation, receiver emails, `sendEmail`), env mapping, ref and email extraction (non-ASCII tokens), link-session cache |
+| `apps/server/src/app.test.ts`                |    44 | Security config, login and sessions, `/ask` modes and limits, budget 429, ledger 503, the two ports and their bind address, `/healthz` (no leaks), webhook route, dedupe, rotation     |
+| `apps/agent/src/run-agent.test.ts`           |    28 | Stream parsing, sandbox args, MCP config, runAgent with a fake CLI (mode, allowed invoices and emails), the reservation ledger, no leaked reservation, the vitest guard, run log       |
+| `apps/agent/src/runs.test.ts`                |    18 | The ledger directly: I/O failures, per-entry validation, pruning, the lock (owner token, live holder, takeover) and 8 real processes against one ledger                                |
+| `packages/oncade-client/src/client.test.ts`  |    14 | Headers, idempotency keys (fixed vectors), retries, timeouts, no real `fetch` under vitest                                                                                             |
+| `evals/grade.test.ts`                        |    10 | The eval grader, including the status-before/after assertions                                                                                                                          |
+| `packages/oncade-client/src/webhook.test.ts` |     8 | Signature verifier, including the malformed signatures that crash Oncade's sample                                                                                                      |
+| `packages/config/src/config.test.ts`         |     5 | Defaults, readable errors naming the variable, live key refused, port clash, budget bounds                                                                                             |
+| `apps/agent/src/ask.test.ts`                 |     5 | `pnpm ask`: flags, budget and ledger messages and exit code 3, other errors not swallowed, usage                                                                                       |
+| `apps/agent/src/prompt.test.ts`              |     2 | The prompt's changelog hash matches the file                                                                                                                                           |
 
 **How the tests were checked: mutation testing.** A passing test proves little if it would also
 pass with the guard removed. Every guard was checked by applying a mutant (remove or invert the
@@ -252,6 +254,28 @@ test now injects the CLI, the config and the run log; it cannot reach the real C
 | The "frees the run lock" test could not tell the lock's 429 from the budget's                                    | Asserts the second body is the budget message, not "Another question is being answered"                | Lock freed only on success: `not to contain 'Another question is being answered'`                                                                                                   |
 | The live-key config test failed by `TypeError` when the guard was removed                                        | A separate test states the expectation                                                                 | `expected [] to deeply equal [ StringMatching{...} ]` instead of `TypeError: .toMatch() expects to receive a string`                                                                |
 | Lexical authorisation: an id in "do NOT cancel <id>" still authorises a cancel                                   | Documented (Known limitations); the prompt keeps "act only on what the user asked"; new eval case      | `do-not-cancel-named`: passed, victim status unchanged on Oncade                                                                                                                    |
+
+**Round 3: verifier on ab1acbe.** Every mutation claimed in rounds 1 and 2 was re-applied and
+killed. New findings, each with its regression test written first and seen red against ab1acbe
+(or, where ab1acbe already behaved, seen killing the named mutant):
+
+| Finding                                                                                                                                                | Fix                                                                                                                                                                                                                                                                            | Test (seen red first) / mutant killed                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ASCII-only email pattern cut a non-ASCII address into a different allowed one (`bоb@acme.com` with Cyrillic о allowed `b@acme.com`)                    | The request is split into tokens around `@` at whitespace and ASCII punctuation only; a token is accepted only if all of it is an ASCII address, so any non-ASCII character in or next to it yields no address                                                                 | `expected [ 'b@acme.com' ] to deeply equal []`, `expected [ 'nal@acme.com' ] ...`, `[ 'bob@acme.co' ]` for a Cyrillic TLD letter; mutant without the sentence-punctuation strip: red                                                       |
+| Stale-lock takeover broke mutual exclusion (stat, unlink, create race; release unlinked someone else's lock)                                           | Lock holds `"<pid> <token>"`, created whole by `link`; taken over only if its process is gone and it is older than `staleMs`; one taker per dead lock (O_EXCL reap file), which re-reads the lock and `rename`s its own over it only if unchanged; release only with our token | 8 real processes, 48 reservations, cap 30, a dead lock and `staleMs` 1 ms: `accepted reservations: expected 46 to be 30`. Mutants killed: take over a live holder, release without token check, no re-read before replace, no reap file    |
+| Ledger entries not validated (string, negative or null amount, missing or invalid `ts` let the run through; a negative amount freed budget)            | Zod schema per entry; any invalid entry is a `BudgetLedgerError` and the ledger is left as it was. Only entries from earlier UTC days are pruned; entries dated later than now (clock skew) are kept and counted                                                               | 8 invalid-entry cases: `expected function to throw an error, but it didn't`; future entry: `expected { reservedUsd: +0 } to deeply equal { reservedUsd: 1 }`. Mutants: no schema, `nonnegative` dropped, `ts` as any string, `>=` -> `===` |
+| Reservation leak: `promptInfo()`, the mode and the extractors ran after `reserveBudget` and before the `try`, so a throw there held the budget all day | Everything that can throw is computed before the reservation; `promptInfo` is injectable                                                                                                                                                                                       | Throwing `promptInfo` three times with room for two runs: `expected 'Error: Daily agent budget of $1.00 re…' to match /CHANGELOG\.md has no entry/`; mutant moving it back after the reservation: red                                      |
+| Unpinned: ledger mkdir / read / write failure as `BudgetLedgerError`                                                                                   | Tests on `reserveBudget` with the message for each                                                                                                                                                                                                                             | Mutants (plain `Error`, or the mkdir failure swallowed): `expected Error: Budget ledger folder ... to be an instance of BudgetLedgerError`, `... to match /sub is not writable \(ENOTDIR\)/`                                               |
+| Unpinned: `/ask` maps `BudgetLedgerError` to 503, `pnpm ask` to exit code 3                                                                            | Tests of the status, the message and the exit code (and that other errors are not swallowed)                                                                                                                                                                                   | Mutants: `expected 500 to be 503`, `expected 429 to be 503`; `pnpm ask` without the mapping throws instead of returning 3                                                                                                                  |
+| Unpinned: `create_draft_invoice` sends the normalised receiver address                                                                                 | The test reads the body the fake Oncade received                                                                                                                                                                                                                               | Raw address to the client: `expected ' Billing@ACME.example ' to be 'billing@acme.example'`                                                                                                                                                |
+| Live test (Oncade "Resend"): an event stored by older code (no `dedupeKey` on the line) was stored again; the key was a hash of the raw body           | Key from the event's content: `id`, else canonical JSON (sorted keys) of event + timestamp + data, else of the whole event without the store's fields. On load the key is also recomputed from every line's content, so legacy lines and raw-body keys still count             | Legacy line + re-delivery with other whitespace and key order: `expected 'stored' to be 'duplicate'` (3 tests). Mutants: no recompute on load, unsorted keys, timestamp / data / event name left out, store fields kept in the fallback    |
+
+Run for real after this round: `node --import tsx apps/agent/src/cli.ts` with `RUNS_LOG` pointing
+at a temporary ledger holding an entry with `amountUsd: "0.6"` printed the ledger error, exited 3,
+logged no run and started no CLI. The real `data/webhooks.jsonl` (8 events, 4 of them legacy
+lines without `dedupeKey`), copied and loaded by the new store: all 8 re-delivered with reversed
+key order and other whitespace were duplicates. The dev server that was running during the live
+test still had the old code; it picks this up on restart.
 
 ## PromptOps
 
@@ -330,23 +354,33 @@ skipped on purpose.
 - **Subscription login puts the OAuth token in the sandbox** (read-write). Use `ANTHROPIC_API_KEY`.
 - **The write guard's authorisation is lexical, not semantic.** Any invoice id or number in the
   request counts as named: inside a quote or pasted text, and in "do NOT cancel <id>" too. The same
-  goes for receiver addresses, and for the word "email" ("send it without email" allows
-  `sendEmail: true`). No attempt is made to parse intent; the guard narrows what an injection can
+  goes for receiver addresses, and for the word "email": a negation ("do not email it", "send it
+  without email") still allows `sendEmail: true`. Text the user pastes into the request, such as
+  an invoice note carrying an injected instruction, counts as the user's own words. Addresses
+  are taken only when the whole token is an ASCII address; anything else (an internationalised
+  address included) is not allowed. No attempt is made to parse intent; the guard narrows what an injection can
   reach to what the user typed, and inside that the system prompt ("act only on what the user
   asked") and the model decide. The eval case `do-not-cancel-named` checks the model on exactly
   this. A draft for a customer named only by name ("invoice Acme like last time") is refused: the
   address has to be in the request.
 - **Budget reservations are conservative.** Each run holds `AGENT_MAX_BUDGET_USD` while it runs,
   so near the cap fewer runs start than would fit their real cost. A process killed before it
-  settled (kill -9, power loss) leaves its reservation in the ledger; it counts for that UTC day.
-  The stale-lock takeover is not atomic: two processes that both find a dead lock can, in a
-  narrow window, both proceed. The cap counts what the CLI reports, or the per-run maximum when it
-  reports nothing.
+  settled (kill -9, power loss) leaves its reservation in the ledger for the rest of that UTC day
+  (fail closed: it blocks budget, never frees it). The budget is shared only between processes
+  that use the same `RUNS_LOG` (the ledger and its lock sit next to it); a process with a
+  different `RUNS_LOG` has its own budget. A lock whose holder is still running is never taken
+  over, so a hung process holding it refuses runs until it exits; a process that dies in the
+  microseconds between claiming a dead lock and replacing it leaves a `.reap-*` file that blocks
+  the takeover until it is removed by hand (fail closed, the error names the lock file). A pid
+  reused by an unrelated process makes a dead lock look alive, with the same effect. Ledger
+  entries are validated; any invalid entry refuses every run until the file is fixed. The cap
+  counts what the CLI reports, or the per-run maximum when it reports nothing.
 - **Idempotency is per run.** Two identical invoices in one run become one; across runs the same
   request creates a new invoice each time.
 - **No webhook timestamp window.** Oncade sends no timestamp header and the body's `timestamp`
-  stays the same on retries, so exact replays are caught by dedupe only; dedupe memory covers the
-  current log and one rotated file.
+  stays the same on retries, so replays are caught by dedupe only; dedupe memory covers the
+  current log and one rotated file. Two genuinely different deliveries with the same event name,
+  timestamp and data would be treated as one.
 - **Rate limits, sessions and the one-run lock are in memory and per process.** A busy server
   answers 429; there is no queue.
 - **Read-only mode still allows `request_invoice_access`**, which creates an Oncade link session

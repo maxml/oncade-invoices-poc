@@ -1,6 +1,19 @@
 # Active context
 
-## State (2026-11-18, after verification round 2)
+## State (2026-11-18, after verification round 3)
+
+- Round 3 (independent verifier on ab1acbe): every earlier mutation re-applied and killed; new
+  findings fixed with tests seen red first (docs/solution.md, Verification rounds): non-ASCII
+  address tokens yield no allowed address; the ledger lock carries an owner token, a live
+  holder is never taken over, one taker per dead lock (O_EXCL reap file + re-read + rename),
+  8-process test; ledger entries validated with Zod (fail closed), future-dated entries kept;
+  nothing that can throw runs between the reservation and its settle; ledger / 503 / exit 3 /
+  normalised receiver email pinned. From the live test: webhook dedupe key from canonical
+  event + timestamp + data, recomputed for stored lines on load (legacy lines without
+  `dedupeKey` now dedupe).
+- `pnpm test`: 186 tests in 10 files. No eval re-run: prompt and agent behaviour unchanged.
+
+## Earlier: after verification round 2
 
 - Round 2 (independent verifier on 54b65e5) found bypasses; all fixed, each test seen red first
   (details in `docs/solution.md`, Verification rounds): the daily budget is now a reservation
@@ -47,7 +60,8 @@
   (done for the current test business).
 - New API keys start with no scopes.
 - Oncade requires `Idempotency-Key` to be a UUID (400 otherwise); not stated in the API reference.
-- Platform webhook events have no id and no timestamp header; dedupe is by body hash.
+- Platform webhook events have no id and no timestamp header; dedupe is by a hash of the
+  canonical event + timestamp + data (a "Resend" repeats all three).
 - Sandbox network is fully open; subscription login exposes the OAuth token inside the sandbox.
 - typescript-eslint 8 needs TypeScript's JS API (`<6.1`), which TypeScript 7 does not ship: the
   root `typescript` is 6.0.x for the linter, `pnpm typecheck` runs TS 7 from the `typescript-7`

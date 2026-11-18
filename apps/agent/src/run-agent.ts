@@ -14,7 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import { parseConfig, type Config } from '../../../packages/config/src/config';
 import { refuseRealInTests } from '../../../packages/config/src/test-guard';
 import { extractEmails, extractInvoiceRefs, requestAsksForEmail } from '../../mcp/src/write-guard';
-import { promptInfo, SYSTEM_PROMPT_FILE } from './prompt';
+import { promptInfo, SYSTEM_PROMPT_FILE, type PromptInfo } from './prompt';
 import {
   DEFAULT_RUNS_LOG,
   defaultLedger,
@@ -224,6 +224,8 @@ export interface AgentDeps {
   ledger: string;
   lock?: LockOptions;
   now: () => Date;
+  /** The system prompt's version and hash. Default: read from apps/agent/prompts. */
+  promptInfo: () => PromptInfo;
 }
 
 function resolveDeps(d: Partial<AgentDeps>): AgentDeps {
@@ -240,6 +242,7 @@ function resolveDeps(d: Partial<AgentDeps>): AgentDeps {
     ledger: d.ledger ?? defaultLedger(runsLog),
     lock: d.lock,
     now: d.now ?? (() => new Date()),
+    promptInfo: d.promptInfo ?? (() => promptInfo()),
   };
 }
 
@@ -257,6 +260,18 @@ export async function runAgent(
   const sandboxed = sandboxMode !== 'off' && !!bwrap;
   if (sandboxMode === 'on' && !bwrap) throw new Error('AGENT_SANDBOX=on but bwrap is not installed');
 
+  // Everything that can throw while preparing the run happens before the reservation below: once it
+  // is made, the only way out is through settle() (try / catch), or it would be held all day.
+  const { readOnly, mode: runMode } = agentMode(opts.allowChanges);
+  const runId = opts.runId ?? randomUUID();
+  const prompt_ = deps.promptInfo();
+  const requestedModel = cfg.AGENT_MODEL;
+  // Only invoices the user's own words name may be sent or cancelled, drafts go only to addresses
+  // the request contains, and email only when it asks for email (apps/mcp/src/write-guard.ts).
+  const allowedInvoices = readOnly ? [] : extractInvoiceRefs(prompt);
+  const allowedEmails = readOnly ? [] : extractEmails(prompt);
+  const emailAllowed = !readOnly && requestAsksForEmail(prompt);
+
   // Daily spend cap, before anything starts: every entry point (web, CLI, eval) runs here. The run
   // reserves its maximum cost in the shared ledger; settle() below replaces it with the real cost.
   const budget: BudgetFiles = { runsLog: deps.runsLog, ledger: deps.ledger, lock: deps.lock };
@@ -271,16 +286,6 @@ export async function runAgent(
       : spawned
         ? { costUsd: reservationUsd, costEstimated: true }
         : {};
-
-  const { readOnly, mode: runMode } = agentMode(opts.allowChanges);
-  const runId = opts.runId ?? randomUUID();
-  const prompt_ = promptInfo();
-  const requestedModel = cfg.AGENT_MODEL;
-  // Only invoices the user's own words name may be sent or cancelled, drafts go only to addresses
-  // the request contains, and email only when it asks for email (apps/mcp/src/write-guard.ts).
-  const allowedInvoices = readOnly ? [] : extractInvoiceRefs(prompt);
-  const allowedEmails = readOnly ? [] : extractEmails(prompt);
-  const emailAllowed = !readOnly && requestAsksForEmail(prompt);
 
   let workDir: string | undefined;
   const started = Date.now();

@@ -23,19 +23,30 @@
 
 const ID_RE = /\b[0-9a-f]{24}\b/gi;
 const NUMBER_RE = /\bINV-\d{4}-\d{4,}\b/gi;
-const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+/**
+ * Every run of characters around an "@" up to whitespace or ASCII punctuation that cannot be part
+ * of an address. Anything else (including any non-ASCII character) stays inside the token, so a
+ * token is accepted whole or not at all: an ASCII-only pattern searched inside "bоb@acme.com"
+ * (Cyrillic о) would find "b@acme.com", a different address.
+ */
+const EMAIL_TOKEN_RE = /[^\s<>()[\]{},;:"'`]*@[^\s<>()[\]{},;:"'`]*/gu;
+const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 
 export const normalizeInvoiceId = (id: string) => id.trim().toLowerCase();
 export const normalizeEmail = (e: string) => e.trim().toLowerCase();
 
-/** Email addresses in the user's request text, normalised. */
+/**
+ * Email addresses in the user's request text, normalised. A token that is not entirely an ASCII
+ * address (after dropping sentence punctuation at its end) yields nothing: fail closed.
+ */
 export function extractEmails(text: string): string[] {
-  return [...new Set((text.match(EMAIL_RE) ?? []).map(normalizeEmail))];
+  const out = (text.match(EMAIL_TOKEN_RE) ?? []).map((t) => t.replace(/[.!?]+$/, '')).filter((t) => EMAIL_RE.test(t));
+  return [...new Set(out.map(normalizeEmail))];
 }
 
 /** Whether the request asks for email ("email", "e-mail"); an address on its own does not. */
 export function requestAsksForEmail(text: string): boolean {
-  return /\be-?mail/i.test(text.replace(EMAIL_RE, ' '));
+  return /\be-?mail/i.test(text.replace(EMAIL_TOKEN_RE, ' '));
 }
 
 /** Parse ONCADE_ALLOWED_EMAILS (comma-separated); anything that is not an address is dropped. */

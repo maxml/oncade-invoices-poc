@@ -38,7 +38,7 @@ allowedInvoices })`. Read-only registers read tools + `propose_invoice_change`; 
 - `apps/server/src/app.ts`: `buildUiApp(deps)` (login, `/ask`, `/healthz`; 404 for proxy headers,
   non-loopback Host or socket) and `buildWebhookApp(deps)` (only `POST /webhooks/oncade`). Both
   testable with `fastify.inject`. `server.ts` serves them on `PORT` and `WEBHOOK_PORT`.
-- `apps/server/src/webhook-store.ts`: parse, dedupe (event id or sha256 of raw body), append,
+- `apps/server/src/webhook-store.ts`: parse, dedupe (event id, else sha256 of canonical event + timestamp + data; keys recomputed from stored lines on load), append,
   rotate at 1 MB. `apps/server/src/env.ts`: `loadEnv()` (.env + Zod, exit 1 on error) and
   `securityConfig()`.
 - `evals/`: `cases.json` (10 cases, fixtures), `grade.ts` (pure grader, incl. real invoice status

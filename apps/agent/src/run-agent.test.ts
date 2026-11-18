@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, appendFileSync, readFileSync, writeFileSync, utimesSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -325,6 +326,25 @@ describe('runAgent daily budget (reservation ledger)', () => {
     expect(JSON.parse(readFileSync(ledger, 'utf8')).reservations).toEqual([]);
   });
 
+  it('a run that fails while preparing (prompt info throws) leaves no reservation behind', async () => {
+    const { deps, spawn, ledger } = setup({ AGENT_DAILY_BUDGET_USD: '1', AGENT_MAX_BUDGET_USD: '0.5' });
+    const broken = () => {
+      throw new Error('prompts/CHANGELOG.md has no entry');
+    };
+    for (let i = 0; i < 3; i++) {
+      const err = await runAgent('q', {}, { ...deps, promptInfo: broken }).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(String(err)).toMatch(/CHANGELOG\.md has no entry/);
+    }
+    expect(spawn).not.toHaveBeenCalled();
+    const left = existsSync(ledger) ? JSON.parse(readFileSync(ledger, 'utf8')).reservations : [];
+    expect(left, 'reservations held by runs that never started').toEqual([]);
+    // And the budget is still free: cap $1 fits two $0.50 runs.
+    await runAgent('q', {}, deps);
+    await runAgent('q', {}, deps);
+    expect(spawn).toHaveBeenCalledTimes(2);
+  });
+
   it.each([['runs log'], ['ledger']])('fails closed: refuses before starting when the %s cannot be written', async (which) => {
     const { deps, spawn, dir } = setup({});
     const notADir = join(dir, 'a-file');
@@ -342,7 +362,8 @@ describe('runAgent daily budget (reservation ledger)', () => {
   it('fails closed while another process holds the ledger lock, and takes over a stale lock', async () => {
     const { deps, spawn, ledger } = setup({});
     const lock = `${ledger}.lock`;
-    writeFileSync(lock, '99999');
+    // A lock from a process that has exited (a live holder is never taken over: runs.test.ts).
+    writeFileSync(lock, `${spawnSync(process.execPath, ['-e', '']).pid} dead-holder`);
     const err = await runAgent('q', {}, { ...deps, lock: { waitMs: 50, staleMs: 10_000 } }).catch((e) => e);
     expect(err).toBeInstanceOf(BudgetLedgerError);
     expect(err.message).toMatch(/locked/);

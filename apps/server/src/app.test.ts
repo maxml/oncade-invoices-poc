@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentResult } from '../../agent/src/run-agent';
-import { BudgetExceededError } from '../../agent/src/runs';
+import { BudgetExceededError, BudgetLedgerError } from '../../agent/src/runs';
 import {
   buildUiApp,
   buildWebhookApp,
@@ -159,6 +159,21 @@ describe('/ask', () => {
     expect(again.statusCode).toBe(429);
     expect(again.body).not.toContain('Another question is being answered');
     expect(again.body).toContain('Daily agent budget of $2.00 reached');
+    expect(runAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it('budget ledger unavailable answers 503 with the reason, not 500, and frees the run lock', async () => {
+    const runAgent = vi.fn(async () => {
+      throw new BudgetLedgerError('Cannot read the budget ledger /x/ledger.json (bad); no run started.');
+    });
+    const { app } = await setup({ runAgent });
+    const cookie = await login(app);
+    for (const q of ['list invoices', 'again']) {
+      const r = await form(app, '/ask', { q }, { cookie });
+      expect(r.statusCode).toBe(503);
+      expect(r.body).toContain('Cannot read the budget ledger /x/ledger.json (bad); no run started.');
+      expect(r.body).not.toContain('Agent failed');
+    }
     expect(runAgent).toHaveBeenCalledTimes(2);
   });
 
@@ -431,6 +446,59 @@ describe('WebhookStore rotation', () => {
     // Same process, no restart: events 0 and 1 now live only in .1 and must still be duplicates.
     expect(s.ingest(ev(0)).status).toBe('duplicate');
     expect(s.ingest(ev(1)).status).toBe('duplicate');
+  });
+
+  /**
+   * Oncade "Resend" re-delivers an event with the same event, timestamp and data. A key from the
+   * raw body broke on two things: a re-delivery serialised differently, and a line stored by
+   * older code without a `dedupeKey` (stored again as new, seen live).
+   */
+  const created = {
+    event: 'Platform.Invoice.Created',
+    data: { invoiceId: 'inv_1', amount: 10 },
+    timestamp: '2026-11-18T00:00:00.000Z',
+  };
+  const reordered = Buffer.from(
+    '{ "timestamp":"2026-11-18T00:00:00.000Z",\n  "data": {"amount":10, "invoiceId":"inv_1"},  "event":"Platform.Invoice.Created" }',
+  );
+
+  it('a legacy log line without dedupeKey + a re-delivery with other whitespace and key order: duplicate', () => {
+    const d = mkdtempSync(join(tmpdir(), 'oncade-store-test-'));
+    dirs.push(d);
+    const f = join(d, 'w.jsonl');
+    writeFileSync(f, JSON.stringify({ ...created, receivedAt: '2026-11-18T00:00:01.000Z' }) + '\n');
+    expect(new WebhookStore(f).ingest(reordered).status).toBe('duplicate');
+    expect(readFileSync(f, 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+
+  it('an event without a timestamp is identified by its whole content, without the fields the store added', () => {
+    const d = mkdtempSync(join(tmpdir(), 'oncade-store-test-'));
+    dirs.push(d);
+    const f = join(d, 'w.jsonl');
+    writeFileSync(f, JSON.stringify({ event: 'E', data: { a: 1 }, receivedAt: '2026-11-18T00:00:01.000Z' }) + '\n');
+    const s = new WebhookStore(f);
+    expect(s.ingest(Buffer.from('{"data":{"a":1},"event":"E"}')).status).toBe('duplicate');
+    expect(s.ingest(Buffer.from('{"data":{"a":2},"event":"E"}')).status).toBe('stored');
+  });
+
+  it('a line stored with a raw-body key (ab1acbe) still dedupes a re-delivery serialised differently', () => {
+    const d = mkdtempSync(join(tmpdir(), 'oncade-store-test-'));
+    dirs.push(d);
+    const f = join(d, 'w.jsonl');
+    const old = `sha256:${createHmac('sha256', 'unrelated').update('x').digest('hex')}`; // any old-style key
+    writeFileSync(f, JSON.stringify({ ...created, receivedAt: '2026-11-18T00:00:01.000Z', dedupeKey: old }) + '\n');
+    expect(new WebhookStore(f).ingest(reordered).status).toBe('duplicate');
+  });
+
+  it('same process: a re-delivery serialised differently is a duplicate; another timestamp or data is not', () => {
+    const d = mkdtempSync(join(tmpdir(), 'oncade-store-test-'));
+    dirs.push(d);
+    const s = new WebhookStore(join(d, 'w.jsonl'));
+    expect(s.ingest(Buffer.from(JSON.stringify(created))).status).toBe('stored');
+    expect(s.ingest(reordered).status).toBe('duplicate');
+    expect(s.ingest(Buffer.from(JSON.stringify({ ...created, timestamp: '2026-11-18T00:00:02.000Z' }))).status).toBe('stored');
+    expect(s.ingest(Buffer.from(JSON.stringify({ ...created, data: { invoiceId: 'inv_2', amount: 10 } }))).status).toBe('stored');
+    expect(s.ingest(Buffer.from(JSON.stringify({ ...created, event: 'Platform.Invoice.Sent' }))).status).toBe('stored');
   });
 
   it('skips torn lines when loading keys', () => {

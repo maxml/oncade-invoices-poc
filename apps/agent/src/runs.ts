@@ -2,20 +2,20 @@
  * One JSON line per agent run in data/runs.jsonl, the reader behind `pnpm runs`, and the daily
  * budget: a reservation ledger next to the runs log, shared by every process through a lock file.
  */
+import { createHash, randomUUID } from 'node:crypto';
 import {
   appendFileSync,
-  closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
-  unlinkSync,
   writeFileSync,
-  writeSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { z } from 'zod';
 
 export const DEFAULT_RUNS_LOG = resolve(import.meta.dirname, '../../../data/runs.jsonl');
 
@@ -116,7 +116,41 @@ export const defaultLedger = (runsLog: string) => join(dirname(runsLog), 'budget
 const code = (e: unknown) => (e as { code?: string })?.code ?? String(e);
 const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
-/** Run `fn` holding `<ledger>.lock` (created with O_EXCL); a stale lock is taken over. */
+/** Whether the process that wrote a lock (`"<pid> <token>"`) may still be running. */
+function holderAlive(content: string): boolean {
+  const pid = Number(content.split(' ')[0]);
+  if (!Number.isInteger(pid) || pid <= 0) return false; // torn or foreign content: judged by age only
+  // Locks are taken and released synchronously, so a lock with our own pid that we are not holding
+  // was left by an earlier process that had the same pid.
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return code(e) === 'EPERM'; // exists, owned by another user
+  }
+}
+
+const readOrNull = (f: string) => {
+  try {
+    return readFileSync(f, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Run `fn` holding `<ledger>.lock`. The lock file holds `"<pid> <token>"` with a token unique to
+ * this acquisition; it is created whole and atomically (written to a temp file, then `link`ed,
+ * which fails if the lock exists).
+ *
+ * A lock is taken over only when its holder process is gone AND it is older than `staleMs`; a
+ * live holder is waited for, then refused (fail closed). Two processes that both find the same
+ * dead lock: each must first create `<lock>.reap-<hash of its content>` with O_EXCL, so only one
+ * can replace it; the winner re-reads the lock and replaces it (atomic `rename` of its own fresh
+ * lock) only if it still holds that same content. Release removes the lock only if it still holds
+ * our token.
+ */
 function withLock<T>(ledger: string, o: LockOptions, fn: () => T): T {
   const lock = `${ledger}.lock`;
   const waitMs = o.waitMs ?? 5_000;
@@ -126,51 +160,84 @@ function withLock<T>(ledger: string, o: LockOptions, fn: () => T): T {
   } catch (e) {
     throw new BudgetLedgerError(`Budget ledger folder ${dirname(ledger)} is not writable (${code(e)}); no run started.`);
   }
+  const mine = `${process.pid} ${randomUUID()}`;
+  const tmp = `${lock}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tmp, mine, { flag: 'wx' });
+  } catch (e) {
+    throw new BudgetLedgerError(`Cannot create the budget lock ${lock} (${code(e)}); no run started.`);
+  }
   const started = Date.now();
-  for (;;) {
-    try {
-      const fd = openSync(lock, 'wx');
-      writeSync(fd, String(process.pid));
-      closeSync(fd);
-      break;
-    } catch (e) {
-      if (code(e) !== 'EEXIST')
-        throw new BudgetLedgerError(`Cannot create the budget lock ${lock} (${code(e)}); no run started.`);
-    }
-    let age: number;
-    try {
-      age = Date.now() - statSync(lock).mtimeMs;
-    } catch {
-      continue; // released in between
-    }
-    if (age > staleMs) {
+  try {
+    for (;;) {
       try {
-        unlinkSync(lock);
-      } catch {
-        // someone else took it over first
+        linkSync(tmp, lock);
+        break;
+      } catch (e) {
+        if (code(e) !== 'EEXIST')
+          throw new BudgetLedgerError(`Cannot create the budget lock ${lock} (${code(e)}); no run started.`);
       }
-      continue;
+      const seen = readOrNull(lock);
+      let age = 0;
+      try {
+        age = Date.now() - statSync(lock).mtimeMs;
+      } catch {
+        continue; // released in between
+      }
+      if (seen !== null && age > staleMs && !holderAlive(seen) && takeOver(lock, seen, tmp)) break;
+      if (Date.now() - started > waitMs)
+        throw new BudgetLedgerError(
+          `Budget ledger is locked by another process (${lock}); no run started. Try again; if no agent run is ` +
+            'in progress and this persists, remove that file.',
+        );
+      sleepSync(5);
     }
-    if (Date.now() - started > waitMs)
-      throw new BudgetLedgerError(`Budget ledger is locked by another process (${lock}); no run started. Try again.`);
-    sleepSync(10);
+  } finally {
+    rmSync(tmp, { force: true });
   }
   try {
     return fn();
   } finally {
-    try {
-      unlinkSync(lock);
-    } catch {
-      // already gone
-    }
+    if (readOrNull(lock) === mine) rmSync(lock, { force: true });
   }
 }
 
+/** Replace the dead lock whose content is `seen` with ours (`tmp`); true when we now hold it. */
+export function takeOver(lock: string, seen: string, tmp: string): boolean {
+  const reap = `${lock}.reap-${createHash('sha256').update(seen).digest('hex').slice(0, 16)}`;
+  try {
+    writeFileSync(reap, String(process.pid), { flag: 'wx' });
+  } catch {
+    return false; // another process is taking over this same dead lock
+  }
+  try {
+    if (readOrNull(lock) !== seen) return false; // already replaced or released
+    // `tmp` must stay for the caller's cleanup and retries, so rename a copy of it.
+    const copy = `${tmp}.takeover`;
+    writeFileSync(copy, readFileSync(tmp));
+    renameSync(copy, lock);
+    return true;
+  } finally {
+    rmSync(reap, { force: true });
+  }
+}
+
+export const withLedgerLock = withLock;
+
+const ReservationSchema = z.object({
+  id: z.string().min(1),
+  ts: z.iso.datetime(),
+  amountUsd: z.number().nonnegative(), // z.number() rejects NaN and Infinity
+  pid: z.number().int(),
+});
+const LedgerSchema = z.object({ reservations: z.array(ReservationSchema) });
+
+/** The ledger, every entry validated: anything malformed throws, and the caller refuses the run. */
 function readReservations(ledger: string): Reservation[] {
   if (!existsSync(ledger)) return [];
-  const v = JSON.parse(readFileSync(ledger, 'utf8')) as { reservations?: unknown };
-  if (!Array.isArray(v?.reservations)) throw new Error('no reservations array');
-  return v.reservations as Reservation[];
+  const v = LedgerSchema.safeParse(JSON.parse(readFileSync(ledger, 'utf8')));
+  if (!v.success) throw new Error(`invalid ledger: ${v.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
+  return v.data.reservations;
 }
 
 function writeReservations(ledger: string, rs: Reservation[]): void {
@@ -179,7 +246,11 @@ function writeReservations(ledger: string, rs: Reservation[]): void {
   renameSync(tmp, ledger);
 }
 
-const sameDay = (ts: string, now: Date) => ts.slice(0, 10) === now.toISOString().slice(0, 10);
+/**
+ * Entries of today or later (UTC day) stay and count. Only earlier days are pruned: a reservation
+ * dated in the future comes from a process whose clock runs ahead, and is still a run in flight.
+ */
+const notBeforeToday = (ts: string, now: Date) => ts.slice(0, 10) >= now.toISOString().slice(0, 10);
 
 /**
  * Before a run: under the lock, refuse unless spent today + reserved by runs in flight + this
@@ -208,8 +279,8 @@ export function reserveBudget(
     } catch (e) {
       throw new BudgetLedgerError(`Cannot read the budget ledger ${f.ledger} (${String(e)}); no run started.`);
     }
-    const today = all.filter((x) => typeof x?.ts === 'string' && sameDay(x.ts, r.now));
-    const reserved = today.reduce((s, x) => s + (Number.isFinite(x.amountUsd) ? x.amountUsd : 0), 0);
+    const today = all.filter((x) => notBeforeToday(x.ts, r.now));
+    const reserved = today.reduce((s, x) => s + x.amountUsd, 0);
     if (spent + reserved + r.amountUsd > r.capUsd) throw new BudgetExceededError(spent, r.capUsd, reserved, r.amountUsd);
     try {
       writeReservations(f.ledger, [...today, { id: r.id, ts: r.now.toISOString(), amountUsd: r.amountUsd, pid: process.pid }]);
@@ -229,7 +300,7 @@ export function settleBudget(f: BudgetFiles, reservationId: string, rec: RunReco
     appendRun(f.runsLog, rec);
     writeReservations(
       f.ledger,
-      readReservations(f.ledger).filter((x) => x?.id !== reservationId),
+      readReservations(f.ledger).filter((x) => x.id !== reservationId),
     );
   });
 }

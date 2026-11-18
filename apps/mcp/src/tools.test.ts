@@ -241,6 +241,8 @@ describe('allow-changes: no email to an address the request did not name', () =>
     const mcp = await connect(false, api.fetch, [], { allowedEmails: ['billing@acme.example'] });
     expect((await call(mcp, 'create_draft_invoice', draft(' Billing@ACME.example '))).isError).toBe(false);
     expect(api.writes.map((w) => w.path)).toEqual(['/invoices']);
+    // The client gets the normalised address the guard checked, not the raw one the model passed.
+    expect((api.writes[0].body as { receiverEmail: string }).receiverEmail).toBe('billing@acme.example');
   });
 
   it('with no address in the request, create_draft_invoice is refused', async () => {
@@ -289,6 +291,32 @@ describe('requestAsksForEmail / extractEmails (decided by runAgent from the requ
       'billing@acme.example',
       'ap@globex.example',
     ]);
+  });
+
+  it('keeps an address at the end of a sentence or in brackets', () => {
+    expect(extractEmails('Bill billing@acme.example. Then <ap@globex.example>, (x@y.example)')).toEqual([
+      'billing@acme.example',
+      'ap@globex.example',
+      'x@y.example',
+    ]);
+  });
+
+  // An ASCII-only pattern used to cut a non-ASCII address down to a DIFFERENT, valid one: the
+  // Cyrillic "о" in "bоb@acme.com" left "b@acme.com" allowed. Fail closed: no address at all.
+  it.each([
+    ['bоb@acme.com'], // Cyrillic o in the local part
+    ['ünal@acme.com'], // u-umlaut at the start
+    ['bob@acme.coм'], // Cyrillic m at the end of the TLD
+    ['bob@аcme.com'], // Cyrillic a in the domain
+    ['«bob@acme.com»'], // adjacent non-ASCII quotes
+    ['bob​@acme.com'], // zero-width space inside
+  ])('a non-ASCII address token %j yields no allowed address', (addr) => {
+    expect(extractEmails(`Create a draft for ${addr} and email it`)).toEqual([]);
+    expect(extractEmails(`Create a draft for ${addr} and email it`)).not.toContain('b@acme.com');
+  });
+
+  it('a non-ASCII token does not hide a separate ASCII address in the same request', () => {
+    expect(extractEmails('not bоb@acme.com but billing@acme.example')).toEqual(['billing@acme.example']);
   });
 });
 
